@@ -8,13 +8,12 @@ Usage (file from --file, positional, or UPLOAD_FILE_PATH in .env):
   python generate_delete_commission_sql.py   # uses UPLOAD_FILE_PATH from .env
 
 Does NOT run DELETE. Optional read-only COUNT preview only.
-Output is SQL-only markdown (SQL comments, no prose).
+Output is raw SQL only (.sql): BEGIN / DELETE / ROLLBACK.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime
 import os
 import sys
 from typing import List, Optional, Set
@@ -94,32 +93,9 @@ def write_raw_delete_sql_md(
     source_label: str = "",
     sheet_policy_count: int = 0,
 ) -> str:
-    """Write SQL-only markdown: hardcoded ARRAY, BEGIN/COMMIT/ROLLBACK. No temp tables."""
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Write raw SQL only: BEGIN / DELETE / ROLLBACK. No comments or markdown."""
     array_sql = sql_text_array(match_numbers)
-    src = source_label or "sheet"
-    body = f"""```sql
--- agency_id = {agency_id}
--- source = {src}
--- sheet_policies = {sheet_policy_count}
--- match_candidates = {len(match_numbers)}
--- generated = {ts}
--- senior eng runs DELETE (not readonly_user)
--- no temp tables; policy numbers hardcoded in ARRAY
-
--- PREVIEW count (safe - run outside transaction)
-SELECT COUNT(*) AS commission_rows_to_delete,
-       COUNT(DISTINCT p.number) AS distinct_policies
-FROM policy_commission pc
-JOIN policies p ON p.uuid = pc.policy_uuid AND p.agency_id = pc.agency_id
-WHERE pc.agency_id = {agency_id}
-  AND p.agency_id = {agency_id}
-  AND p.number = ANY(
-{array_sql}
-  );
-
--- ========== DELETE ==========
-BEGIN;
+    body = f"""BEGIN;
 
 DELETE FROM policy_commission pc
 USING policies p
@@ -130,22 +106,11 @@ WHERE pc.policy_uuid = p.uuid
 {array_sql}
   );
 
--- VERIFY expect 0 (still inside transaction)
-SELECT COUNT(*) AS remaining
-FROM policy_commission pc
-JOIN policies p ON p.uuid = pc.policy_uuid AND p.agency_id = pc.agency_id
-WHERE pc.agency_id = {agency_id}
-  AND p.agency_id = {agency_id}
-  AND p.number = ANY(
-{array_sql}
-  );
-
--- COMMIT;    -- after remaining = 0
--- ROLLBACK;  -- if wrong
-```
+ROLLBACK;
 """
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
+    # utf-8 no BOM, LF newlines — avoids paste/client parse errors from .md / CRLF / BOM
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(body)
     return os.path.abspath(out_path)
 
@@ -153,7 +118,7 @@ WHERE pc.agency_id = {agency_id}
 def write_delete_md_for_file(
     input_path: str,
     agency_id: int = 5,
-    out_path: str = "docs/delete_commission_agency5.md",
+    out_path: str = "docs/delete_commission_agency5.sql",
 ) -> str:
     df = load_file(input_path)
     sheet_policies = extract_policy_numbers(df)
@@ -212,8 +177,8 @@ def main() -> int:
     parser.add_argument(
         "--out",
         type=str,
-        default="docs/delete_commission_agency5.md",
-        help="Output markdown path",
+        default="docs/delete_commission_agency5.sql",
+        help="Output .sql path",
     )
     parser.add_argument(
         "--skip-db-preview",
@@ -257,7 +222,7 @@ def main() -> int:
         sheet_policy_count=len(sheet_policies),
     )
     print(f"Wrote: {abs_out}")
-    print("Share MD with senior eng. After DELETE remaining=0, re-run validator with --force-post-mismatches.")
+    print("Share .sql with senior eng. After DELETE + remaining=0, re-run validator with --force-post-mismatches.")
     return 0
 
 

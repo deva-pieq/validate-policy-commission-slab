@@ -147,6 +147,28 @@ def load_env_file(env_file_path: str = ".env", override: bool = False) -> int:
     return count
 
 
+def resolve_sso_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve Keycloak username/password without picking up the Windows USERNAME
+    (e.g. LENOVO) when .env has USERNAME=email@....
+    Prefer SSO_USERNAME / SSO_PASSWORD; only use USERNAME if it looks like an email.
+    """
+    username = (
+        os.environ.get("SSO_USERNAME")
+        or os.environ.get("SSO_USER")
+        or os.environ.get("API_USERNAME")
+    )
+    raw_user = os.environ.get("USERNAME") or os.environ.get("USER")
+    if not username and raw_user and "@" in raw_user:
+        username = raw_user
+    password = (
+        os.environ.get("SSO_PASSWORD")
+        or os.environ.get("API_PASSWORD")
+        or os.environ.get("PASSWORD")
+    )
+    return (username.strip() if username else None), (password if password else None)
+
+
 # ---------------------------------------------------------------------------
 # Formatting & Parsing Helpers
 # ---------------------------------------------------------------------------
@@ -2485,6 +2507,11 @@ def stage2_db_verify_dataset(
                             _file_fee_val = parse_rate(_carrier_comm_raw)
                             _file_payout_method_code = 2
 
+                        # File expects OVERRIDE (4) for OVR products / agency-100% — do not treat type-1 COMMISSION as matched
+                        _file_ctype = resolve_commission_type(
+                            file_commission_split, product_name=prod_name
+                        )
+
                         match_found = False
                         unmatched_agent = False
                         period_found = False
@@ -2554,7 +2581,18 @@ def stage2_db_verify_dataset(
                                             split_matches = (abs(matched_db_value - row_split) <= tolerance or abs(matched_db_value - row_rate) <= tolerance)
                                             fee_matches = (abs(db_fee - _file_fee_val) <= tolerance)
                                             payout_matches = (db_payout_code == _file_payout_method_code)
-                                            if split_matches and fee_matches and payout_matches and db_tm == expected_db_tm:
+                                            try:
+                                                db_ctype = int(db_rec.get("commission_type") or 1)
+                                            except (TypeError, ValueError):
+                                                db_ctype = 1
+                                            type_matches = db_ctype == _file_ctype
+                                            if (
+                                                split_matches
+                                                and fee_matches
+                                                and payout_matches
+                                                and type_matches
+                                                and db_tm == expected_db_tm
+                                            ):
                                                 match_found = True
                                             matched_commission_uuid = db_rec.get("commission_uuid")
                                             matched_db_rec = db_rec
@@ -2788,19 +2826,29 @@ def stage2_db_verify_dataset(
                                         old_p_label = "Fixed Fee" if db_payout_code == 1 else "Percentage"
                                         new_p_label = "Fixed Fee" if _file_payout_method_code == 1 else "Percentage"
                                         diff_lines.append(f"   Payout Method: {old_p_label} ➔ {new_p_label}")
-    
-                                    if not diff_lines:
-                                        # If only names were fuzzy matched or rates differed by <0.00%, don't bother PUTting
-                                        continue
-                                    
-                                    diff_text = "\n".join(diff_lines)
-    
 
                                     _ctype = resolve_commission_type(
                                         merged_splits,
                                         product_name=prod_name,
                                         db_commission_type=matched_db_rec.get("commission_type", 1),
                                     )
+                                    try:
+                                        db_ctype_for_diff = int(matched_db_rec.get("commission_type") or 1)
+                                    except (TypeError, ValueError):
+                                        db_ctype_for_diff = 1
+                                    if db_ctype_for_diff != _ctype:
+                                        _type_labels = {1: "COMMISSION", 2: "RENEWAL", 3: "BONUS", 4: "OVERRIDE"}
+                                        diff_lines.append(
+                                            f"   Commission Type: {_type_labels.get(db_ctype_for_diff, db_ctype_for_diff)} "
+                                            f"➔ {_type_labels.get(_ctype, _ctype)}"
+                                        )
+    
+                                    if not diff_lines:
+                                        # If only names were fuzzy matched or rates differed by <0.00%, don't bother PUTting
+                                        continue
+                                    
+                                    diff_text = "\n".join(diff_lines)
+
                                     _default_rule = commission_rule_name_for_type(_ctype)
                                     _rule_name = matched_db_rec.get("rule_name") or _default_rule
                                     # Force OVERRIDE naming when file is agency-100%
@@ -3260,8 +3308,7 @@ def run_post_commission_payloads(
     sso_url_raw = os.environ.get("AUTH_URL", "https://prod.auth.pieq.ai")
     sso_url = f"{sso_url_raw.rstrip('/')}/realms/pieq-sso/protocol/openid-connect/token"
     client_id = os.environ.get("KEYCLOAK_CLIENT_ID") or os.environ.get("client_id") or "pieq-app"
-    username = os.environ.get("SSO_USERNAME") or os.environ.get("USERNAME")
-    password = os.environ.get("SSO_PASSWORD") or os.environ.get("PASSWORD")
+    username, password = resolve_sso_credentials()
 
     token = fetch_sso_token(logger, sso_url, client_id, username, password)
     if not token:
@@ -3964,9 +4011,9 @@ def main():
             print(f"Policies needing recreate after delete: {len(post_payloads)} rule payload(s)")
             print(f"  - missing in DB : {len(unique_missing_payloads or [])}")
             print(f"  - mismatch vs DB: {len(unique_mismatch_payloads or [])}")
-            delete_md_path = os.path.join(output_dir, "delete_commission_agency5.md")
+            delete_md_path = os.path.join(output_dir, "delete_commission_agency5.sql")
             docs_md_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "docs", "delete_commission_agency5.md"
+                os.path.dirname(os.path.abspath(__file__)), "docs", "delete_commission_agency5.sql"
             )
             try:
                 from generate_delete_commission_sql import write_delete_md_for_file
