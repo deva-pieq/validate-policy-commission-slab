@@ -611,6 +611,80 @@ def _parse_split_people(commission_split) -> Dict[str, dict]:
     return people
 
 
+def fix_inclusive_month_band_overlaps(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
+    """
+    Remove inclusive From/To overlaps on the same policy+product+person.
+
+    Example (Agency):
+        13-72 then 72-120  ->  13-72 then 73-120
+    so month 72 is not claimed by two contiguous bands (which creates a bad
+    single-month 72-72 slice after year-band re-slicing).
+
+    Rule: for each person sorted by From Month, if next.From <= prev.To
+    (and prev.To > 0), bump next.From to prev.To + 1. Open-ended bands
+    (To Month = 0) are left untouched as the prior end.
+    """
+    if df is None or df.empty:
+        return df, {"rows_fixed": 0, "examples": []}
+
+    df_out = df.copy()
+    pol_col = _find_col(df_out, ("policy no", "policy number", "policy", "policyno", "policy_number"))
+    prod_col = _find_col(df_out, ("product", "product name", "product_description", "product_name"))
+    fm_col = _find_col(df_out, ("from month", "from_month", "month", "month from", "month_from"))
+    tm_col = _find_col(df_out, ("to month", "to_month", "month to", "month_to"))
+    agent_col = _find_col(df_out, ("agent id", "agent_id", "agentid", "eacid"))
+    seq_col = _find_col(df_out, ("sequence", "seq"))
+    contract_col = _find_col(df_out, ("contract", "level", "role"))
+
+    if not all([pol_col, fm_col, tm_col]):
+        return df_out, {"rows_fixed": 0, "examples": [], "skipped": True}
+
+    group_keys = [pol_col]
+    if prod_col:
+        group_keys.append(prod_col)
+    # Prefer Agent ID; fall back to Sequence+Contract so Agency-only rows still group
+    if agent_col:
+        group_keys.append(agent_col)
+    else:
+        if seq_col:
+            group_keys.append(seq_col)
+        if contract_col:
+            group_keys.append(contract_col)
+
+    rows_fixed = 0
+    examples: List[dict] = []
+
+    for _, group in df_out.groupby(group_keys, sort=False):
+        ordered_idx = sorted(
+            group.index.tolist(),
+            key=lambda i: (_month_to_int(df_out.at[i, fm_col]), _month_to_int(df_out.at[i, tm_col]), i),
+        )
+        prev_tm = None
+        for idx in ordered_idx:
+            fm = _month_to_int(df_out.at[idx, fm_col])
+            tm = _month_to_int(df_out.at[idx, tm_col])
+            if prev_tm is not None and prev_tm > 0 and fm > 0 and fm <= prev_tm:
+                new_fm = prev_tm + 1
+                # Only bump when the band would still be valid (or open-ended)
+                if tm <= 0 or new_fm <= tm:
+                    if len(examples) < 20:
+                        examples.append({
+                            "policy": str(df_out.at[idx, pol_col]),
+                            "old_from": fm,
+                            "new_from": new_fm,
+                            "to": tm,
+                        })
+                    df_out.at[idx, fm_col] = new_fm
+                    fm = new_fm
+                    rows_fixed += 1
+            # Track end of this band for the next comparison (use possibly bumped from)
+            if tm > 0:
+                prev_tm = tm if prev_tm is None else max(prev_tm, tm)
+            # open-ended (tm==0): do not constrain later bands via prev_tm beyond current
+
+    return df_out, {"rows_fixed": rows_fixed, "examples": examples}
+
+
 def normalize_year_bands(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     """
     Re-slice From-To so every role shares the finest common month bands for a policy+product.
@@ -2202,7 +2276,7 @@ def stage2_db_verify_dataset(
     import_script_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "policy_commission_import_validation_script"))
     if import_script_dir not in sys.path:
         sys.path.append(import_script_dir)
-    from import_policy_commission import commission_payload_issues
+    from import_policy_commission import commission_payload_issues, _person_name_key
 
     # Extract unique policy numbers for batch SQL chunking
     unique_exact_policy_numbers = []
@@ -2227,11 +2301,75 @@ def stage2_db_verify_dataset(
 
     # Pre-fetch all user UUIDs mapping for agency
     db_user_map = db_mgr.fetch_all_users_map(agency_id) if not dry_run and db_mgr.conn else {}
+    # File highest-order agent is the intended writing agent; log when DB differs
+    writing_agent_corrections: List[dict] = []
+    _wa_correction_seen: Set[str] = set()
 
     def writing_agent_name_for(record) -> str:
         if not isinstance(record, dict):
             return ""
         return db_mgr.format_writing_agent(record.get("writing_agent_user_id"))
+
+    def _highest_order_person(splits: list) -> Optional[dict]:
+        """Highest order in Agency→…→Sub Agent hierarchy = writing agent on the sheet."""
+        best = None
+        best_order = -1
+        for s in splits or []:
+            if not isinstance(s, dict):
+                continue
+            role = str(s.get("role") or "").strip().casefold()
+            if role == "agency":
+                continue
+            if (
+                role == "sub agent"
+                and not str(s.get("user_name") or "").strip()
+                and not str(s.get("user_uuid") or "").strip()
+            ):
+                continue
+            try:
+                order = int(s.get("order"))
+            except (TypeError, ValueError):
+                continue
+            if order >= best_order:
+                best_order = order
+                best = s
+        return best
+
+    def resolve_writing_agent_for_payload(
+        sanitized_splits: list,
+        db_record: Optional[dict],
+        *,
+        pol_number: str,
+        pol_uuid: str,
+    ) -> str:
+        """
+        Prefer the file's highest-order agent as writingAgentName (sheet is source of truth).
+
+        When DB policies.writing_agent_user_id names a different person (e.g. Jacob Yale vs
+        Michael Dunavant), record a correction so we can emit UPDATE SQL for senior eng.
+        """
+        highest = _highest_order_person(sanitized_splits)
+        file_name = str((highest or {}).get("user_name") or "").strip()
+        file_uuid = str((highest or {}).get("user_uuid") or "").strip()
+        file_code = str((highest or {}).get("user_code") or "").strip()
+        db_name = writing_agent_name_for(db_record) if db_record else ""
+
+        if file_name and db_name and _person_name_key(file_name) != _person_name_key(db_name):
+            dedup = str(pol_uuid or pol_number)
+            if dedup and dedup not in _wa_correction_seen:
+                _wa_correction_seen.add(dedup)
+                writing_agent_corrections.append({
+                    "policyNumber": pol_number,
+                    "policyUuid": pol_uuid,
+                    "dbWritingAgentName": db_name,
+                    "fileWritingAgentName": file_name,
+                    "fileWritingAgentUuid": file_uuid,
+                    "fileWritingAgentCode": file_code,
+                    "dbWritingAgentUserId": str((db_record or {}).get("writing_agent_user_id") or ""),
+                })
+
+        # Sheet hierarchy wins so commission POST is not blocked by a stale DB writing agent
+        return file_name or db_name
 
     # Pre-fetch ALL products, policies, and policy_commission rules in 1 single bulk SQL query
     chunk_db_map = {}
@@ -2436,7 +2574,12 @@ def stage2_db_verify_dataset(
                         missing_payload = {
                             "policyUuid": found_pol_uuid,
                             "policyNumber": pol_number,
-                            "writingAgentName": writing_agent_name_for(db_records[0] if db_records else None),
+                            "writingAgentName": resolve_writing_agent_for_payload(
+                                sanitized_splits,
+                                db_records[0] if db_records else None,
+                                pol_number=pol_number,
+                                pol_uuid=found_pol_uuid,
+                            ),
                             "ruleName": commission_rule_name_for_type(_ctype),
                             "version": 1,
                             "commissionType": _ctype,
@@ -2672,7 +2815,12 @@ def stage2_db_verify_dataset(
                                 missing_payload = {
                                     "policyUuid": found_pol_uuid,
                                     "policyNumber": pol_number,
-                                    "writingAgentName": writing_agent_name_for(db_records[0] if db_records else None),
+                                    "writingAgentName": resolve_writing_agent_for_payload(
+                                        sanitized_splits,
+                                        db_records[0] if db_records else None,
+                                        pol_number=pol_number,
+                                        pol_uuid=found_pol_uuid,
+                                    ),
                                     "ruleName": commission_rule_name_for_type(_ctype),
                                     "version": 1,
                                     "commissionType": _ctype,
@@ -2854,12 +3002,20 @@ def stage2_db_verify_dataset(
                                     # Force OVERRIDE naming when file is agency-100%
                                     if _ctype == 4 and "override" not in str(_rule_name).lower():
                                         _rule_name = _default_rule
+                                    _wa_db_rec = (
+                                        matched_db_rec
+                                        if matched_db_rec.get("writing_agent_user_id")
+                                        else (db_records[0] if db_records else None)
+                                    )
                                     mismatch_payload = {
                                         "rule_uuid": matched_commission_uuid,
                                         "policyNumber": pol_number,
                                         "policyUuid": matched_db_rec.get("policy_uuid"),
-                                        "writingAgentName": writing_agent_name_for(
-                                            matched_db_rec if matched_db_rec.get("writing_agent_user_id") else (db_records[0] if db_records else None)
+                                        "writingAgentName": resolve_writing_agent_for_payload(
+                                            merged_splits,
+                                            _wa_db_rec,
+                                            pol_number=pol_number,
+                                            pol_uuid=str(matched_db_rec.get("policy_uuid") or found_pol_uuid or ""),
                                         ),
                                         "ruleName": _rule_name,
                                         "version": matched_db_rec.get("version") or 1,
@@ -2939,7 +3095,58 @@ def stage2_db_verify_dataset(
             seen_mismatches.add(mp["rule_uuid"])
             unique_mismatch_payloads.append(mp)
 
-    return df_matched, df_ambiguous, df_unmatched, unique_missing_payloads, unique_mismatch_payloads, invalid_user_uuid_payloads
+    return (
+        df_matched,
+        df_ambiguous,
+        df_unmatched,
+        unique_missing_payloads,
+        unique_mismatch_payloads,
+        invalid_user_uuid_payloads,
+        writing_agent_corrections,
+    )
+
+
+def write_writing_agent_update_sql(
+    corrections: List[dict],
+    agency_id: int,
+    out_path: str,
+) -> str:
+    """
+    Write UPDATE SQL so policies.writing_agent_user_id matches the file's
+    highest-order agent (e.g. Michael Dunavant instead of Jacob Yale).
+    Script does NOT execute these updates.
+    """
+    lines = [
+        "-- Writing agent corrections from commission upload file",
+        f"-- agency_id = {agency_id}",
+        "-- Source of truth: highest-order person on the sheet (Sub Agent / Seq 1).",
+        "-- Review with senior eng before running. This script does NOT execute UPDATEs.",
+        "",
+    ]
+    for c in corrections or []:
+        pol = str(c.get("policyNumber") or "")
+        pol_uuid = str(c.get("policyUuid") or "").strip()
+        new_uuid = str(c.get("fileWritingAgentUuid") or "").strip()
+        new_name = str(c.get("fileWritingAgentName") or "")
+        old_name = str(c.get("dbWritingAgentName") or "")
+        old_uid = str(c.get("dbWritingAgentUserId") or "")
+        code = str(c.get("fileWritingAgentCode") or "")
+        lines.append(f"-- Policy {pol}: '{old_name}' -> '{new_name}' (code {code})")
+        if old_uid:
+            lines.append(f"-- previous writing_agent_user_id = {old_uid}")
+        if not pol_uuid or not new_uuid:
+            lines.append("-- SKIPPED: missing policyUuid or fileWritingAgentUuid")
+            lines.append("")
+            continue
+        lines.append("UPDATE policies")
+        lines.append(f"SET writing_agent_user_id = '{new_uuid}'")
+        lines.append(f"WHERE uuid = '{pol_uuid}'")
+        lines.append(f"  AND agency_id = {int(agency_id)};")
+        lines.append("")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return os.path.abspath(out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -3564,6 +3771,21 @@ def main():
         print("\n----------------------------------------------------------")
         print("PRE-STAGE 1: YEAR-BAND NORMALIZE + OVERRIDE 3-ROW EXPAND")
         print("----------------------------------------------------------")
+        df_comm_dedup, overlap_summary = fix_inclusive_month_band_overlaps(df_comm_dedup)
+        n_overlap = int(overlap_summary.get("rows_fixed", 0) or 0)
+        if n_overlap:
+            print(
+                f"🔗 Inclusive month-band overlap fix: {n_overlap:,} row(s) "
+                f"(From bumped to previous To+1 so bands do not share an endpoint)"
+            )
+            for ex in overlap_summary.get("examples") or []:
+                print(
+                    f"   • Policy {ex.get('policy')}: "
+                    f"{ex.get('old_from')}->{ex.get('to')} became "
+                    f"{ex.get('new_from')}->{ex.get('to')}"
+                )
+        else:
+            print("🔗 Inclusive month-band overlap fix: 0 row(s) (no endpoint overlaps)")
         before_rows = len(df_comm_dedup)
         df_comm_dedup, band_summary = normalize_year_bands(df_comm_dedup)
         print(
@@ -3673,7 +3895,15 @@ def main():
     else:
         print("   ⚠️ Skipping DB snapshot (no active DB connection or dry-run mode).")
 
-    df_stage2_matched, df_stage2_ambiguous, df_stage2_unmatched, unique_missing_payloads, unique_mismatch_payloads, invalid_user_uuid_payloads = stage2_db_verify_dataset(
+    (
+        df_stage2_matched,
+        df_stage2_ambiguous,
+        df_stage2_unmatched,
+        unique_missing_payloads,
+        unique_mismatch_payloads,
+        invalid_user_uuid_payloads,
+        writing_agent_corrections,
+    ) = stage2_db_verify_dataset(
         df_valid=df_stage1_valid,
         db_mgr=db_mgr,
         agency_id=agency_id,
@@ -3681,6 +3911,29 @@ def main():
         tolerance=args.tolerance,
     )
     db_mgr.close()
+
+    if writing_agent_corrections:
+        wa_sql_path = os.path.join(output_dir, "update_writing_agent_from_file.sql")
+        wa_json_path = os.path.join(
+            output_dir,
+            f"writing_agent_corrections_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        )
+        abs_wa_sql = write_writing_agent_update_sql(
+            writing_agent_corrections, agency_id=agency_id, out_path=wa_sql_path
+        )
+        with open(wa_json_path, "w", encoding="utf-8") as f:
+            json.dump(writing_agent_corrections, f, indent=2)
+        print(
+            f" ✍️ Writing-agent corrections: {len(writing_agent_corrections):,} policy(ies) "
+            f"(file highest-order agent preferred over DB writing_agent_user_id)"
+        )
+        for c in writing_agent_corrections[:15]:
+            print(
+                f"   • {c.get('policyNumber')}: "
+                f"DB '{c.get('dbWritingAgentName')}' → file '{c.get('fileWritingAgentName')}'"
+            )
+        print(f" 📁 UPDATE SQL (share with senior eng; not executed): {abs_wa_sql}")
+        print(f" 📁 Corrections JSON: {wa_json_path}")
 
     if invalid_user_uuid_payloads:
         missing_uuid_file = os.path.join(output_dir, f"rejected_missing_user_uuid_payloads_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
