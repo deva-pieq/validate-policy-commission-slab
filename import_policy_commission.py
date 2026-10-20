@@ -285,6 +285,18 @@ def extract_carrier_and_product(data: dict) -> tuple:
     return carrier, product
 
 
+def classify_contract_role(contract_val: str) -> str:
+    """Map Contract column to agency | sales_leader | agent | sub_agent."""
+    c = str(contract_val or "").strip().lower()
+    if c in ("agency", ""):
+        return "agency"
+    if "sales" in c or "leader" in c:
+        return "sales_leader"
+    if "sub" in c or re.match(r"^sa\d+$", c):
+        return "sub_agent"
+    return "agent"
+
+
 # ---------------------------------------------------------------------------
 # Core Payload Builder: Grouping & Transform
 # ---------------------------------------------------------------------------
@@ -435,6 +447,10 @@ def build_policy_commission_import_payload(group_records: list) -> dict:
             or agent_id
         )
 
+        contract = read_field(
+            r_data, ["Contract", "contract", "Role", "role", "Level", "level"]
+        )
+
         rate_str = read_field(
             r_data, ["Rate %", "Rate $", "Rate", "rate", "Commission %"]
         )
@@ -446,29 +462,54 @@ def build_policy_commission_import_payload(group_records: list) -> dict:
                 "user_code": agent_id if agent_id else None,
                 "rateValue": rate_val,
                 "sequence": sequence,
+                "contract": contract,
             }
         )
 
-    # Sort DESCENDING by Sequence: highest sequence is Agency (order 1)
-    raw_split_items.sort(key=lambda x: x["sequence"], reverse=True)
+    has_contract_info = any(bool(item.get("contract")) for item in raw_split_items)
+
+    def _role_rank(item: dict) -> int:
+        role = classify_contract_role(item.get("contract", ""))
+        return {"agency": 0, "sales_leader": 1, "agent": 2, "sub_agent": 3}.get(role, 2)
+
+    if has_contract_info:
+        raw_split_items.sort(key=lambda x: (_role_rank(x), -x["sequence"]))
+    else:
+        # Fallback: Sort DESCENDING by Sequence: highest sequence is Agency (order 1)
+        raw_split_items.sort(key=lambda x: x["sequence"], reverse=True)
 
     commission_split = []
     for index, item in enumerate(raw_split_items):
         order = index + 1
-        if order == 1:
-            role = "Agency"
-            entity = "agency"
-        elif order == 2:
-            role = "Sales Leader"
-            entity = "agent"
-        elif order == 3:
-            role = "Agent"
-            entity = "agent"
+        if has_contract_info:
+            role_key = classify_contract_role(item.get("contract", ""))
+            if role_key == "agency":
+                role = "Agency"
+                entity = "agency"
+            elif role_key == "sales_leader":
+                role = "Sales Leader"
+                entity = "agent"
+            elif role_key == "sub_agent":
+                role = "Sub Agent"
+                entity = "agent"
+            else:
+                role = "Agent"
+                entity = "agent"
         else:
-            role = "Sub Agent"
-            entity = "agent"
+            if order == 1:
+                role = "Agency"
+                entity = "agency"
+            elif order == 2:
+                role = "Sales Leader"
+                entity = "agent"
+            elif order == 3:
+                role = "Agent"
+                entity = "agent"
+            else:
+                role = "Sub Agent"
+                entity = "agent"
 
-        level = "" if order == 1 else f"Level {index}"
+        level = "" if role == "Agency" else f"Level {index}"
 
         commission_split.append(
             {

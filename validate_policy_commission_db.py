@@ -39,6 +39,12 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+# Ensure UTF-8 output encoding on Windows consoles
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import numpy as np
 import pandas as pd
 import json
@@ -101,11 +107,12 @@ try:
     DB_DRIVER_AVAILABLE = True
 except ImportError:
     try:
-        import psycopg2_binary as psycopg2
-        from psycopg2 import sql
-        from psycopg2.extras import RealDictCursor
+        import importlib
+        psycopg2 = importlib.import_module("psycopg2_binary")
+        sql = getattr(psycopg2, "sql", None)
+        RealDictCursor = getattr(importlib.import_module("psycopg2_binary.extras"), "RealDictCursor", None)
         DB_DRIVER_AVAILABLE = True
-    except ImportError:
+    except (ImportError, AttributeError):
         DB_DRIVER_AVAILABLE = False
 
 
@@ -592,12 +599,14 @@ def _parse_split_people(commission_split) -> Dict[str, dict]:
         person = {"name": name, "code": code}
         if "sales" in role or "leader" in role:
             people["sales_leader"] = person
+        elif "sub" in role or role == "sub_agent":
+            people["sub_agent"] = person
         elif role == "broker":
             # Sheet Broker = writing agent; also candidate for SL when app stuffed MLB into SL
             broker_as_agent = person
             if "agent" not in people:
                 people["agent"] = person
-        elif role == "agent" or "sub" in role or role.startswith("lvl") or role.startswith("level"):
+        elif role == "agent" or role.startswith("lvl") or role.startswith("level"):
             if "agent" not in people or role == "agent":
                 people["agent"] = person
 
@@ -949,6 +958,8 @@ def ensure_override_three_rows(
                             people["sales_leader"] = found["sales_leader"]
                         if "agent" in found and "agent" not in people:
                             people["agent"] = found["agent"]
+                        if "sub_agent" in found and "sub_agent" not in people:
+                            people["sub_agent"] = found["sub_agent"]
                     if "sales_leader" in people and "agent" in people:
                         break
                 db_lookups += 1
@@ -976,7 +987,7 @@ def ensure_override_three_rows(
             role_map: Dict[str, pd.Series] = {}
             for _, row in band.iterrows():
                 role = classify_contract_role(row.get(contract_col, ""))
-                # Prefer Broker/LVL as agent; keep first agency / first SL
+                # Prefer Broker/LVL as agent; keep first agency / first SL / first Sub Agent
                 if role not in role_map:
                     role_map[role] = row
                 elif role == "agent" and str(role_map[role].get(contract_col, "")).lower() != "agent":
@@ -987,6 +998,7 @@ def ensure_override_three_rows(
             agency_row = role_map.get("agency")
             sl_row = role_map.get("sales_leader")
             agent_row = role_map.get("agent")
+            sub_row = role_map.get("sub_agent")
 
             # Drop bogus SL that is actually MLB/agency (live-app OVR bug)
             if sl_row is not None and agent_name_col:
@@ -1032,16 +1044,46 @@ def ensure_override_three_rows(
             pol_key = str(pol).strip().strip("'\"")
             db_people = db_people_by_pol.get(pol_key, {})
 
-            if agent_row is None and sl_row is None:
-                # Agency-only: pull both from DB (MLB already filtered in _parse_split_people)
+            if agent_row is None and sl_row is None and sub_row is None:
+                # Agency-only: pull from DB (MLB already filtered in _parse_split_people)
                 sl_info = db_people.get("sales_leader") or {}
                 ag_info = db_people.get("agent") or {}
+                sub_info = db_people.get("sub_agent") or {}
                 if sl_info and _is_mlb_or_agency_person(sl_info.get("name", ""), sl_info.get("code", "")):
                     sl_info = {}
                 if ag_info and _is_mlb_or_agency_person(ag_info.get("name", ""), ag_info.get("code", "")):
                     ag_info = {}
-                if not sl_info and not ag_info:
+                if sub_info and _is_mlb_or_agency_person(sub_info.get("name", ""), sub_info.get("code", "")):
+                    sub_info = {}
+
+                if not sl_info and not ag_info and not sub_info:
                     miss_log.append(f"{pol_key} | {prod}")
+                elif sub_info:
+                    # 4-person override: Sub Agent=1, Agent=2, SL=3, Agency=4
+                    sub_dict = _synth_row(
+                        "Sub Agent",
+                        sub_info.get("name", ""),
+                        sub_info.get("code", ""),
+                        sequence=1,
+                    )
+                    ag_dict = _synth_row(
+                        "Agent",
+                        ag_info.get("name", "") or sub_info.get("name", ""),
+                        ag_info.get("code", "") or sub_info.get("code", ""),
+                        sequence=2,
+                    )
+                    sl_dict = _synth_row(
+                        "Sales Leader",
+                        sl_info.get("name", "") or ag_info.get("name", "") or sub_info.get("name", ""),
+                        sl_info.get("code", "") or ag_info.get("code", "") or sub_info.get("code", ""),
+                        sequence=3,
+                    )
+                    if seq_col and contract_col in parts[0].columns:
+                        agency_mask = parts[0][contract_col].astype(str).str.strip().str.lower() == "agency"
+                        parts[0].loc[agency_mask, seq_col] = 4
+                    parts.append(pd.DataFrame([sl_dict, ag_dict, sub_dict]))
+                    rows_appended += 3
+                    group_changed = True
                 else:
                     # Broker/Agent alone → same person for SL and Agent @ 0%
                     if not sl_info and ag_info:
@@ -1309,10 +1351,10 @@ def stage1_pre_validate_dataset(
     norm_dict: Dict[str, str] = None,
     agent_roster_dict: Dict[str, str] = None,
     tolerance: float = 0.01,
-) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """
     Stage 1: Applies sequence rollups and validates carrier rates against master rate sheet.
-    Returns: (df_stage1_valid, df_stage1_invalid, summary_dict)
+    Returns: (df_stage1_valid, df_stage1_invalid, df_stage1_zero, summary_dict)
     """
     df_norm_splits = rollup_commission_splits(df_comm)
     df_out = df_norm_splits.copy()
@@ -1618,12 +1660,13 @@ class DatabaseManager:
             return False
 
         try:
+            sslmode = os.getenv("DB_SSLMODE") or ("require" if "rds.amazonaws.com" in str(self.db_url or self.host) else "prefer")
             target_info = ""
             if self.db_url:
                 clean_url = str(self.db_url).strip()
                 if clean_url.lower().startswith("jdbc:"):
                     clean_url = clean_url[5:]
-                conn_kwargs = {"dsn": clean_url, "connect_timeout": 5, "options": "-c statement_timeout=180000"}
+                conn_kwargs = {"dsn": clean_url, "connect_timeout": 5, "options": "-c statement_timeout=180000", "sslmode": sslmode}
                 if self.user:
                     conn_kwargs["user"] = self.user
                 if self.password:
@@ -1633,15 +1676,15 @@ class DatabaseManager:
                 db_match = re.search(r"/([^/?]+)", clean_url)
                 log_host = host_match.group(1) if host_match else "remote host"
                 log_db = db_match.group(1) if db_match else "db"
-                target_info = f"Host: '{log_host}', DB: '{log_db}', User: '{self.user or 'default'}'"
+                target_info = f"Host: '{log_host}', DB: '{log_db}', User: '{self.user or 'default'}', SSL: '{sslmode}'"
 
                 print(f"   🔌 Connecting to PostgreSQL ({target_info}) [Timeout: 5s]...", flush=True)
                 self.conn = psycopg2.connect(**conn_kwargs)
             else:
-                target_info = f"Host: '{self.host}:{self.port}', DB: '{self.dbname}', User: '{self.user}'"
+                target_info = f"Host: '{self.host}:{self.port}', DB: '{self.dbname}', User: '{self.user}', SSL: '{sslmode}'"
                 print(f"   🔌 Connecting to PostgreSQL ({target_info}) [Timeout: 5s]...", flush=True)
                 self.conn = psycopg2.connect(
-                    host=self.host, port=self.port, dbname=self.dbname, user=self.user, password=self.password, connect_timeout=5, options="-c statement_timeout=180000"
+                    host=self.host, port=self.port, dbname=self.dbname, user=self.user, password=self.password, connect_timeout=5, options="-c statement_timeout=180000", sslmode=sslmode
                 )
 
             self.conn.set_session(readonly=True, autocommit=True)
@@ -1746,24 +1789,17 @@ class DatabaseManager:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if user_code:
                     clean_code = clean_agent_code(str(user_code))
+                    # Match by code on tenant_id or agency_id
                     cur.execute(
-                        "SELECT uuid FROM users WHERE agency_id = %s AND (user_code = %s OR agent_id = %s) LIMIT 1;",
-                        (agency_id, clean_code, clean_code)
+                        "SELECT uuid FROM users WHERE (tenant_id = %s OR agency_id = %s) AND (code = %s OR code = %s) LIMIT 1;",
+                        (agency_id, agency_id, clean_code, str(user_code).strip())
                     )
                     row = cur.fetchone()
                     if row and row.get("uuid"):
                         return str(row["uuid"])
                 if user_name:
                     norm_name = " ".join(str(user_name).strip().lower().split())
-                    cur.execute(
-                        "SELECT uuid FROM users WHERE agency_id = %s AND (lower(name) = %s OR lower(full_name) = %s OR lower(user_name) = %s) LIMIT 1;",
-                        (agency_id, norm_name, norm_name, norm_name)
-                    )
-                    row = cur.fetchone()
-                    if row and row.get("uuid"):
-                        return str(row["uuid"])
-                    
-                    # Fallback to contacts table: concat first_name and last_name, take relationship_id as user_uuid
+                    # Check contacts table by full name, first name, or last name
                     cur.execute(
                         "SELECT relationship_id FROM contacts WHERE agency_id = %s AND (lower(concat(first_name, ' ', last_name)) = %s OR lower(first_name) = %s OR lower(last_name) = %s) AND relationship_id IS NOT NULL LIMIT 1;",
                         (agency_id, norm_name, norm_name, norm_name)
@@ -1771,6 +1807,16 @@ class DatabaseManager:
                     row = cur.fetchone()
                     if row and row.get("relationship_id"):
                         return str(row["relationship_id"])
+                    # Check common nicknames e.g. Greg -> Gregory
+                    if norm_name.startswith("greg "):
+                        alt_name = "gregory " + norm_name[5:]
+                        cur.execute(
+                            "SELECT relationship_id FROM contacts WHERE agency_id = %s AND lower(concat(first_name, ' ', last_name)) = %s AND relationship_id IS NOT NULL LIMIT 1;",
+                            (agency_id, alt_name)
+                        )
+                        row = cur.fetchone()
+                        if row and row.get("relationship_id"):
+                            return str(row["relationship_id"])
         except Exception as e:
             pass
         return None
@@ -1783,48 +1829,25 @@ class DatabaseManager:
         self.user_display_by_uuid = {}
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # 1. Fetch from users table by tenant_id or agency_id
                 cur.execute("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'users';
-                """)
-                cols = set(r["column_name"].lower() for r in cur.fetchall())
-                
-                code_col = "user_code" if "user_code" in cols else ("agent_id" if "agent_id" in cols else None)
-                display_code_col = code_col or ("code" if "code" in cols else None)
-                name_col = "name" if "name" in cols else ("full_name" if "full_name" in cols else ("user_name" if "user_name" in cols else None))
-                
-                select_cols = ["uuid"]
-                if code_col:
-                    select_cols.append(code_col)
-                elif display_code_col:
-                    select_cols.append(display_code_col)
-                if name_col:
-                    select_cols.append(name_col)
-                    
-                query = f"SELECT {', '.join(select_cols)} FROM users WHERE agency_id = %s;"
-                cur.execute(query, (agency_id,))
+                    SELECT uuid, code 
+                    FROM users 
+                    WHERE (tenant_id = %s OR agency_id = %s) AND uuid IS NOT NULL;
+                """, (agency_id, agency_id))
                 rows = cur.fetchall()
                 for r in rows:
                     u_uuid = str(r.get("uuid", "")).strip()
                     if not u_uuid:
                         continue
-                    if code_col and r.get(code_col):
-                        c_val = str(r[code_col]).strip().lower()
-                        if c_val:
-                            user_map[c_val] = u_uuid
-                    if name_col and r.get(name_col):
-                        n_val = " ".join(str(r[name_col]).strip().lower().split())
-                        if n_val:
-                            user_map[n_val] = u_uuid
-                    display = self.user_display_by_uuid.setdefault(u_uuid.lower(), {"name": "", "code": ""})
-                    raw_code = r.get(display_code_col) if display_code_col else None
-                    if raw_code and not display["code"]:
-                        display["code"] = str(raw_code).strip()
-                    if name_col and r.get(name_col) and not display["name"]:
-                        display["name"] = " ".join(str(r[name_col]).strip().split())
-                            
-                # Query contacts table for fallback mappings (concat first_name + last_name -> relationship_id)
+                    raw_code = str(r.get("code") or "").strip()
+                    if raw_code:
+                        clean_c = clean_agent_code(raw_code).lower()
+                        user_map[raw_code.lower()] = u_uuid
+                        user_map[clean_c] = u_uuid
+                        self.user_display_by_uuid[u_uuid.lower()] = {"name": "", "code": raw_code}
+
+                # 2. Query contacts table for fallback mappings (concat first_name + last_name -> relationship_id)
                 try:
                     cur.execute("""
                         SELECT relationship_id, first_name, last_name 
@@ -1841,6 +1864,12 @@ class DatabaseManager:
                         full = " ".join(f"{fname} {lname}".lower().split())
                         if full and full not in user_map:
                             user_map[full] = rel_id
+                        # Nickname variations (Greg <-> Gregory)
+                        if fname.lower() == "gregory":
+                            user_map[" ".join(f"greg {lname}".lower().split())] = rel_id
+                        elif fname.lower() == "greg":
+                            user_map[" ".join(f"gregory {lname}".lower().split())] = rel_id
+
                         full_display = " ".join(f"{fname} {lname}".split())
                         if full_display:
                             display = self.user_display_by_uuid.setdefault(rel_id.lower(), {"name": "", "code": ""})
@@ -2231,14 +2260,14 @@ def stage2_db_verify_dataset(
     dry_run: bool = False,
     chunk_size: int = 2000,
     tolerance: float = 0.02,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list, list, list, list]:
     """
     Stage 2: Database Verification for Stage-1 Valid Records.
     Uses chunked Partition-First SQL Batch JOIN Queries (2000 policy numbers per chunk).
-    Returns: (matched_df, ambiguous_df, unmatched_df, missing_policy_payloads)
+    Returns: (matched_df, ambiguous_df, unmatched_df, missing_policy_payloads, mismatch_policy_payloads, invalid_user_uuid_payloads, writing_agent_corrections)
     """
     if df_valid.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [], [], []
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [], [], [], []
 
     df_out = df_valid.copy().reset_index(drop=True)
 
@@ -2252,6 +2281,7 @@ def stage2_db_verify_dataset(
     split_col = "Normalized_Split_Share_%" if "Normalized_Split_Share_%" in df_out.columns else None
     fm_col = next((c for c in df_out.columns if str(c).strip().lower() in ("from month", "from_month", "month", "month from", "month_from")), None)
     tm_col = next((c for c in df_out.columns if str(c).strip().lower() in ("to month", "to_month", "month to", "month_to")), None)
+    amt_col = next((c for c in df_out.columns if str(c).strip().lower() in ("amount", "fee amount", "fee_amount", "carrier commission")), None)
 
     obtained_product_uuids = [""] * len(df_out)
     obtained_policy_uuids = [""] * len(df_out)
@@ -2861,32 +2891,75 @@ def stage2_db_verify_dataset(
                                 unmatched_count += 1
                                 
                                 if matched_commission_uuid and matched_db_rec:
-                                    # Merge DB fields into file splits and build diff
+                                    # Merge DB fields into file splits and build diff using role-aware matching
                                     merged_splits = []
                                     diff_lines = []
                                     
                                     db_splits_list = db_split_raw if isinstance(db_split_raw, list) else []
-                                    db_split_dict = {str(s.get("order", "")): s for s in db_splits_list}
-                                    
-                                    for f_split in file_commission_split:
+
+                                    def _role_key_of(item: dict) -> str:
+                                        c_val = str(item.get("contract") or item.get("role") or item.get("level") or "").strip().lower()
+                                        return classify_contract_role(c_val)
+
+                                    used_db_indices = set()
+                                    matched_db_by_fidx = {}
+                                    for f_idx, f_split in enumerate(file_commission_split):
+                                        f_role = _role_key_of(f_split)
+                                        f_code = clean_agent_code(str(f_split.get("user_code") or "").strip().lower())
+                                        f_name = _person_name_key(str(f_split.get("user_name") or ""))
+
+                                        best_match_idx = None
+                                        # 1. Match by role AND (code or name)
+                                        for db_idx, db_item in enumerate(db_splits_list):
+                                            if db_idx in used_db_indices:
+                                                continue
+                                            db_role = _role_key_of(db_item)
+                                            if db_role != f_role:
+                                                continue
+                                            db_code = clean_agent_code(str(db_item.get("user_code") or "").strip().lower())
+                                            db_name = _person_name_key(str(db_item.get("user_name") or ""))
+                                            if f_role == "agency" and db_role == "agency":
+                                                best_match_idx = db_idx
+                                                break
+                                            if f_code and db_code and (f_code == db_code or are_codes_matching(f_code, db_code)):
+                                                best_match_idx = db_idx
+                                                break
+                                            if f_name and db_name and (f_name == db_name or are_names_matching(f_name, db_name)):
+                                                best_match_idx = db_idx
+                                                break
+
+                                        # 2. Match by role alone if only one candidate with that role exists
+                                        if best_match_idx is None:
+                                            role_candidates = [
+                                                db_idx for db_idx, db_item in enumerate(db_splits_list)
+                                                if db_idx not in used_db_indices and _role_key_of(db_item) == f_role
+                                            ]
+                                            if len(role_candidates) == 1:
+                                                best_match_idx = role_candidates[0]
+
+                                        if best_match_idx is not None:
+                                            used_db_indices.add(best_match_idx)
+                                            matched_db_by_fidx[f_idx] = db_splits_list[best_match_idx]
+
+                                    for f_idx, f_split in enumerate(file_commission_split):
                                         m_split = f_split.copy()
                                         order_str = str(m_split.get("order", ""))
-                                        db_s = db_split_dict.get(order_str)
+                                        db_s = matched_db_by_fidx.get(f_idx)
                                         
                                         f_code = str(m_split.get("user_code") or "").strip().lower()
                                         f_name = " ".join(str(m_split.get("user_name") or "").strip().lower().split())
-    
+
                                         if db_s:
                                             db_code = str(db_s.get("user_code") or "").strip().lower()
                                             db_name = " ".join(str(db_s.get("user_name") or "").strip().lower().split())
-    
+
                                             # Cache DB user_uuid for fast lookup
                                             if db_s.get("user_uuid"):
                                                 if db_code:
                                                     db_user_map[db_code] = db_s["user_uuid"]
                                                 if db_name:
                                                     db_user_map[db_name] = db_s["user_uuid"]
-    
+
                                             agent_changed = False
                                             if f_code and db_code:
                                                 if not (f_code == db_code or are_codes_matching(f_code, db_code) or are_names_matching(f_name, db_name)):
@@ -2894,22 +2967,22 @@ def stage2_db_verify_dataset(
                                             elif f_name and db_name:
                                                 if not (f_name == db_name or are_names_matching(f_name, db_name)):
                                                     agent_changed = True
-    
+
                                             old_val = float(db_s.get("commission_value") or 0.0)
                                             new_val = float(m_split.get("commission_value") or 0.0)
                                             val_changed = abs(old_val - new_val) > tolerance
-    
+
                                             db_user_disp = f"{db_s.get('user_name', '')} ({db_s.get('user_code', '')})".strip() or "N/A"
                                             f_user_disp = f"{m_split.get('user_name', '')} ({m_split.get('user_code', '')})".strip() or "N/A"
-    
+
                                             if agent_changed and val_changed:
                                                 diff_lines.append(f"   Order {order_str} | User: {db_user_disp} ➔ {f_user_disp} | Rate: {old_val}% ➔ {new_val}%")
                                             elif agent_changed:
                                                 diff_lines.append(f"   Order {order_str} | User: {db_user_disp} ➔ {f_user_disp}")
                                             elif val_changed:
                                                 diff_lines.append(f"   Order {order_str} | User: {f_user_disp} | Rate: {old_val}% ➔ {new_val}%")
-    
-                                            # Preserve existing DB fields only if agent did NOT change
+
+                                            # Preserve existing DB fields (Rule C: DB values are authoritative for existing policies)
                                             if not agent_changed:
                                                 for key in ["user_uuid", "user_name", "user_code"]:
                                                     if key in db_s:
@@ -2917,16 +2990,20 @@ def stage2_db_verify_dataset(
                                             for key in ["role", "level"]:
                                                 if key in db_s and not m_split.get(key):
                                                     m_split[key] = db_s[key]
+                                            # Preserve protected DB commission_value
+                                            m_split["commission_value"] = old_val
                                         else:
                                             diff_lines.append(f"   Order {order_str} | User: [NEW] ➔ {m_split.get('user_name', 'N/A')} | Rate: [NEW] ➔ {m_split.get('commission_value', 0.0)}%")
                                             if "level" in m_split:
                                                 m_split["level"] = normalize_level(m_split["level"])
-                                            
+                                            # Newly introduced participants in existing policy update default to 0.0% unless specified
+                                            m_split["commission_value"] = 0.0
+
                                         if str(m_split.get("order", "")) == "1" or str(m_split.get("role", "")).lower() == "agency":
                                             m_split["user_uuid"] = "62a97a01-2801-4c7c-9cd0-cf38f2e0a4f4"
                                             m_split["user_code"] = ""
                                             m_split["level"] = ""
-    
+
                                         # Lookup user_uuid if missing (e.g. for new orders)
                                         if not m_split.get("user_uuid"):
                                             u_code = str(m_split.get("user_code") or "").strip().lower()
@@ -2936,26 +3013,41 @@ def stage2_db_verify_dataset(
                                                 fetched_uuid = db_user_map.get(u_name)
                                             if not fetched_uuid and (u_code or u_name):
                                                 fetched_uuid = db_mgr.get_user_uuid(agency_id, user_code=m_split.get("user_code"), user_name=m_split.get("user_name"))
-                                                # Cache result in db_user_map to avoid redundant DB queries
                                                 if u_code:
                                                     db_user_map[u_code] = fetched_uuid
                                                 if u_name:
                                                     db_user_map[u_name] = fetched_uuid
                                             if fetched_uuid:
                                                 m_split["user_uuid"] = fetched_uuid
-                                        # Ensure no negative commission values
+
                                         c_val = float(m_split.get("commission_value") or 0.0)
                                         m_split["commission_value"] = max(0.0, c_val)
-    
+
                                         merged_splits.append(m_split)
-                                    
-                                    # Preserve any extra DB split orders that were not present in the input file
-                                    file_orders = {str(f.get("order", "")) for f in file_commission_split}
-                                    for db_s in db_splits_list:
-                                        db_order_str = str(db_s.get("order", ""))
-                                        if db_order_str and db_order_str not in file_orders:
-                                            merged_splits.append(db_s.copy())
-                                    
+
+                                    # Preserve any extra DB split roles that were not present in the input file
+                                    # (Do NOT preserve empty placeholder/dummy slots that have no agent assigned and 0% commission)
+                                    file_roles = {_role_key_of(f) for f in file_commission_split}
+                                    for db_idx, db_s in enumerate(db_splits_list):
+                                        if db_idx not in used_db_indices and _role_key_of(db_s) not in file_roles:
+                                            has_valid_uuid = bool(db_s.get("user_uuid"))
+                                            has_val = float(db_s.get("commission_value") or 0.0) > 0.0
+                                            if has_valid_uuid or has_val:
+                                                merged_splits.append(db_s.copy())
+
+                                    # Override split-sum correction: when Agency takes 100% in an OVERRIDE, set non-agency to 0% to prevent 199% sums
+                                    _candidate_ctype = resolve_commission_type(
+                                        merged_splits,
+                                        product_name=prod_name,
+                                        db_commission_type=matched_db_rec.get("commission_type", 1),
+                                    )
+                                    if _candidate_ctype == 4:
+                                        agency_item = next((s for s in merged_splits if str(s.get("role", "")).lower() == "agency"), None)
+                                        if agency_item and float(agency_item.get("commission_value") or 0.0) >= 99.99:
+                                            for s in merged_splits:
+                                                if str(s.get("role", "")).lower() != "agency":
+                                                    s["commission_value"] = 0.0
+
                                     merged_splits.sort(key=lambda s: int(s.get("order") or 999))
                                     db_fm_val = int(matched_db_rec.get("month_from") or 1)
                                     db_tm_val = int(matched_db_rec.get("month_to") or 12) if matched_db_rec.get("month_to") is not None else "None"
@@ -2990,11 +3082,11 @@ def stage2_db_verify_dataset(
                                             f"   Commission Type: {_type_labels.get(db_ctype_for_diff, db_ctype_for_diff)} "
                                             f"➔ {_type_labels.get(_ctype, _ctype)}"
                                         )
-    
+
                                     if not diff_lines:
                                         # If only names were fuzzy matched or rates differed by <0.00%, don't bother PUTting
                                         continue
-                                    
+
                                     diff_text = "\n".join(diff_lines)
 
                                     _default_rule = commission_rule_name_for_type(_ctype)
@@ -3007,6 +3099,7 @@ def stage2_db_verify_dataset(
                                         if matched_db_rec.get("writing_agent_user_id")
                                         else (db_records[0] if db_records else None)
                                     )
+                                    # Rule C: preserve protected DB values in mismatch_payload
                                     mismatch_payload = {
                                         "rule_uuid": matched_commission_uuid,
                                         "policyNumber": pol_number,
@@ -3021,10 +3114,10 @@ def stage2_db_verify_dataset(
                                         "version": matched_db_rec.get("version") or 1,
                                         "commissionType": _ctype,
                                         "paymentFrequency": matched_db_rec.get("payment_frequency", 1),
-                                        "payoutMethod": _file_payout_method_code,
+                                        "payoutMethod": db_payout_code,
                                         "monthFrom": file_fm,
                                         "monthTo": expected_db_tm,
-                                        "feeAmount": _file_fee_val,
+                                        "feeAmount": db_fee_val,
                                         "premiumAmount": float(matched_db_rec.get("premium_amount") or 0.0),
                                         "commissionSplit": merged_splits,
                                         "_diff_text": diff_text
@@ -3036,7 +3129,12 @@ def stage2_db_verify_dataset(
                                     if _file_payout_method_code == 2:
                                         _db_pct_total = round(sum(float(s.get("commission_value") or 0.0) for s in db_splits_list), 2)
                                         _new_pct_total = round(sum(float(s.get("commission_value") or 0.0) for s in merged_splits), 2)
-                                        if abs(_db_pct_total - _new_pct_total) > tolerance:
+                                        is_199_override_fix = (
+                                            _ctype == 4
+                                            and _db_pct_total > 100.0 + tolerance
+                                            and abs(_new_pct_total - 100.0) <= tolerance
+                                        )
+                                        if not is_199_override_fix and abs(_db_pct_total - _new_pct_total) > tolerance:
                                             split_issues.append(
                                                 f"Split sum mismatch: DB left {_db_pct_total:.2f}% != File right {_new_pct_total:.2f}%"
                                             )
@@ -3558,6 +3656,34 @@ def run_post_commission_payloads(
         payload_to_send.pop("writingAgentName", None)
         payload_to_send.pop("rule_uuid", None)
         body = {k: v for k, v in payload_to_send.items() if not str(k).startswith("_")}
+
+        # Ensure camelCase + snake_case compatibility for each split item so both API and UI bind correctly
+        if "commissionSplit" in body and isinstance(body["commissionSplit"], list):
+            enriched_splits = []
+            for item in body["commissionSplit"]:
+                if isinstance(item, dict):
+                    clean_item = dict(item)
+                    u_uuid = clean_item.get("user_uuid") or clean_item.get("userUuid")
+                    if u_uuid:
+                        clean_item["user_uuid"] = u_uuid
+                        clean_item["userUuid"] = u_uuid
+                    clean_item.pop("userId", None)
+                    u_name = clean_item.get("user_name") or clean_item.get("userName")
+                    if u_name:
+                        clean_item["user_name"] = u_name
+                        clean_item["userName"] = u_name
+                    u_code = clean_item.get("user_code") or clean_item.get("userCode")
+                    if u_code:
+                        clean_item["user_code"] = u_code
+                        clean_item["userCode"] = u_code
+                    c_val = clean_item.get("commission_value") if clean_item.get("commission_value") is not None else clean_item.get("commissionValue")
+                    if c_val is not None:
+                        clean_item["commission_value"] = float(c_val)
+                        clean_item["commissionValue"] = float(c_val)
+                    enriched_splits.append(clean_item)
+                else:
+                    enriched_splits.append(item)
+            body["commissionSplit"] = enriched_splits
 
         def _post_once(tok: str) -> Tuple[bool, Optional[str]]:
             req = urllib.request.Request(
@@ -4092,7 +4218,7 @@ def main():
     # Create markdown summary file
     md_summary_path = os.path.join(output_dir, f"validation_summary_{run_version}.md")
     try:
-        with open(md_summary_path, "w") as md_file:
+        with open(md_summary_path, "w", encoding="utf-8") as md_file:
             md_file.write("# Validation Summary Report\n\n")
             md_file.write(f"**Total Input Records Uploaded:** {tot_records}\n")
             if s1_dup > 0:
