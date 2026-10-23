@@ -642,9 +642,9 @@ AGENCY_USER_UUID = "62a97a01-2801-4c7c-9cd0-cf38f2e0a4f4"
 
 
 def _person_name_key(value) -> str:
-    """Lowercase name with collapsed spaces, without a trailing '(Code: ...)' label."""
+    """Lowercase name with collapsed spaces, without a trailing '(Code: ...)' or '(ID)' label."""
     text = str(value or "")
-    text = re.sub(r"\s*\(code:.*?\)\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text)
     key = " ".join(text.casefold().split())
     # This file uses both forms for the same writing agent.
     if key == "greg teipel":

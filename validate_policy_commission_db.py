@@ -84,17 +84,35 @@ def are_codes_matching(code1: str, code2: str) -> bool:
     return False
 
 
+def clean_name_ignoring_id(name) -> str:
+    """Strips agent IDs, numbers, or codes in parentheses, prefixes like '8307933 - Gregory Teipel', and generational suffixes (Jr, Sr, II, III, IV, V)."""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    s = str(name).strip()
+    s = re.sub(r"^\s*[\w\d]+\s*-\s*", "", s).strip()
+    s = re.sub(r"\s*\([^)]*\)$", "", s).strip()
+    s = re.sub(r"\s+\b(jr|sr|[ivx]+)\b\.?\s*$", "", s, flags=re.IGNORECASE).strip()
+    return s
+
+
 def are_names_matching(name1: str, name2: str) -> bool:
-    """Check if two agent names match, collapsing extra whitespace and normalizing case & aliases."""
+    """Check if two agent names match, collapsing extra whitespace, normalizing case, aliases & extra middle names."""
     if not name1 or not name2:
         return False
-    n1 = " ".join(str(name1).lower().split())
-    n2 = " ".join(str(name2).lower().split())
-    if n1 == n2:
-        return True
-    if ("main line" in n1 or "mlb" in n1) and ("main line" in n2 or "mlb" in n2):
-        return True
-    return False
+    c1 = clean_name_ignoring_id(name1)
+    c2 = clean_name_ignoring_id(name2)
+    try:
+        from validate_apl_vs_db_after_import import compare_person_names
+        res = compare_person_names(c1, c2)
+        return res["status"] in ("EXACT_MATCH", "NORMALIZED_MATCH")
+    except ImportError:
+        n1 = " ".join(c1.lower().split())
+        n2 = " ".join(c2.lower().split())
+        if n1 == n2:
+            return True
+        if ("main line" in n1 or "mlb" in n1) and ("main line" in n2 or "mlb" in n2):
+            return True
+        return False
 
 
 
@@ -1798,7 +1816,7 @@ class DatabaseManager:
                     if row and row.get("uuid"):
                         return str(row["uuid"])
                 if user_name:
-                    norm_name = " ".join(str(user_name).strip().lower().split())
+                    norm_name = " ".join(clean_name_ignoring_id(user_name).lower().split())
                     # Check contacts table by full name, first name, or last name
                     cur.execute(
                         "SELECT relationship_id FROM contacts WHERE agency_id = %s AND (lower(concat(first_name, ' ', last_name)) = %s OR lower(first_name) = %s OR lower(last_name) = %s) AND relationship_id IS NOT NULL LIMIT 1;",
@@ -2664,6 +2682,9 @@ def stage2_db_verify_dataset(
                         )
                         file_split_json = json.dumps(file_commission_split)
 
+                        row_contract = str(row.get(contract_col, "")).strip() if contract_col else ""
+                        row_role = classify_contract_role(row_contract)
+
                         row_rate = parse_rate(row.get(rate_col, 0.0)) if rate_col else 0.0
                         row_split = float(row.get("Normalized_Split_Share_%", 0.0))
                         row_agent = str(row.get(agent_col, "")).strip() if agent_col else ""
@@ -2727,12 +2748,17 @@ def stage2_db_verify_dataset(
                             db_payout_code = 1 if (isinstance(db_payout_raw, int) and db_payout_raw == 1) or str(db_payout_raw).strip() in ("1", "FIXED FEE", "FIXED_FEE") else 2
 
                             if isinstance(db_split_raw, list):
-                                for item in db_split_raw:
+                                # Prioritize splits matching the row's contract role
+                                sorted_items = sorted(
+                                    db_split_raw,
+                                    key=lambda it: 0 if (isinstance(it, dict) and str(it.get("role") or "").strip().lower() == row_role.lower()) else 1
+                                )
+                                for item in sorted_items:
                                     if not isinstance(item, dict):
                                         continue
                                         
                                     db_code = str(item.get("user_code") or "").strip()
-                                    db_name = str(item.get("user_name") or "").strip()
+                                    db_name = clean_name_ignoring_id(item.get("user_name"))
                                     norm_db_name = " ".join(db_name.lower().split())
                                     
                                     # Match Agent by user_code, fallback to normalized user_name
@@ -2951,7 +2977,7 @@ def stage2_db_verify_dataset(
 
                                         if db_s:
                                             db_code = str(db_s.get("user_code") or "").strip().lower()
-                                            db_name = " ".join(str(db_s.get("user_name") or "").strip().lower().split())
+                                            db_name = " ".join(clean_name_ignoring_id(db_s.get("user_name")).lower().split())
 
                                             # Cache DB user_uuid for fast lookup
                                             if db_s.get("user_uuid"):
