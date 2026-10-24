@@ -125,6 +125,7 @@ WHERE agency_id = {int(agency_id)}
   AND uuid = ANY(
 {array_sql}
   );
+COMMIT;
 
 ROLLBACK;
 """
@@ -154,6 +155,7 @@ WHERE pc.policy_uuid = p.uuid
 {array_sql}
   );
 COMMIT;
+
 ROLLBACK;
 """
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
