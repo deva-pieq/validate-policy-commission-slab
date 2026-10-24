@@ -19,7 +19,7 @@ Two companion scripts cover standalone delete-SQL generation and a separate API 
 | Script | Role |
 |--------|------|
 | `validate_policy_commission_db.py` | Main 2-stage validate + DB verify + optional POST recreate |
-| `generate_delete_commission_sql.py` | Build raw `DELETE` SQL only (does **not** execute it) |
+| `generate_delete_commission_sql.py` | SQL writer used by the validator. Running it alone does not delete the sheet. |
 | `import_policy_commission.py` | Upload sheet → API → create commission rules (standalone importer) |
 
 ---
@@ -188,38 +188,12 @@ python validate_policy_commission_db.py --file Files -y --force-post-mismatches 
 
 **Delete → POST flow**
 
-1. Validator writes `delete_commission_agency5.sql` (also under `docs/`).
+1. Validator writes `delete_commission_agency5.sql` (also under `docs/`). The `DELETE` lists mismatched `policy_commission.uuid` values only. A policy whose slabs all match is omitted. On a mixed policy, only the mismatched slab is deleted.
 2. Share SQL with a senior engineer; this repo **never** runs `DELETE`.
-3. After delete and remaining count is `0`, answer `y` — or re-run with `--force-post-mismatches --skip-delete-gate`.
-4. Script POSTs new commission rules only (no PUT).
+3. After those mismatch rows are deleted and the remaining count is `0`, answer `y` — or re-run with `--force-post-mismatches --skip-delete-gate`.
+4. Script POSTs the missing and mismatched rules (no PUT). Matched slabs are not posted.
 
----
-
-### 2. Generate delete SQL only
-
-Useful when you want the SQL without running full validation/POST.
-
-```bash
-python generate_delete_commission_sql.py --file Files
-python generate_delete_commission_sql.py --file "Files/foo.csv"
-python generate_delete_commission_sql.py   # uses UPLOAD_FILE_PATH
-
-# Custom output + no DB count preview
-python generate_delete_commission_sql.py --file Files --out docs/delete_commission_agency5.sql --skip-db-preview
-```
-
-#### Flags — `generate_delete_commission_sql.py`
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `file_path` (positional) | — | Same as `--file` / `UPLOAD_FILE_PATH` |
-| `--file` | from `.env` | Sheet file or directory |
-| `--env-file` | `.env` | Env file path |
-| `--agency-id` | `5` | Agency ID in generated SQL |
-| `--out` | `docs/delete_commission_agency5.sql` | Output `.sql` path |
-| `--skip-db-preview` | off | Skip read-only COUNT of rows that would match |
-
-SQL is wrapped in `BEGIN;` … `ROLLBACK;` so it is safe to review before changing the final transaction.
+`generate_delete_commission_sql.py` no longer builds a delete from every policy number on the sheet. Run the validator to produce the SQL.
 
 ---
 
@@ -267,7 +241,7 @@ python import_policy_commission.py --api-base-url https://prod.api.pieq.ai -v
 | `db_matched_commission_*.xlsx` | 2 | File vs DB matches |
 | `db_unmatched_commission_*.xlsx` | 2 | Missing / mismatched rules |
 | `validation_summary_*.md` | 2 | Counts + mismatch detail |
-| `delete_commission_agency5.sql` | Gate | Raw DELETE for review/execution |
+| `delete_commission_agency5.sql` | Gate | DELETE of mismatched commission uuids only |
 | `db_commission_snapshot_post_update_*.xlsx` | Post | Snapshot after successful POST recreate |
 | `rejected_missing_user_uuid_payloads_*.json` | Post | Payloads skipped for missing user UUID |
 
@@ -279,7 +253,7 @@ python import_policy_commission.py --api-base-url https://prod.api.pieq.ai -v
 2. Ensure `RATE_SHEET_PATH`, `NORM_FILE_PATH`, and `AGENT_ROSTER_PATH` are set if you use them.
 3. Run `python validate_policy_commission_db.py`.
 4. Review `validation_summary_*.md` and unmatched Excel.
-5. If recreate is needed: share `delete_commission_agency5.sql`, wait for DELETE + remaining `0`, then confirm or re-run with `--force-post-mismatches --skip-delete-gate`.
+5. If recreate is needed: share `delete_commission_agency5.sql` (mismatch uuids only), wait for that DELETE + remaining `0`, then confirm or re-run with `--force-post-mismatches --skip-delete-gate`.
 6. Confirm post-update snapshot looks correct.
 
 For a first-time bulk import of a clean sheet (no DB compare), use `import_policy_commission.py` instead.
@@ -291,7 +265,7 @@ For a first-time bulk import of a clean sheet (no DB compare), use `import_polic
 ```
 .
 ├── validate_policy_commission_db.py   # Main validator + DB verify + POST gate
-├── generate_delete_commission_sql.py  # Standalone DELETE SQL generator
+├── generate_delete_commission_sql.py  # Mismatch-uuid DELETE SQL writer
 ├── import_policy_commission.py        # API upload / create importer
 ├── requirements.txt
 ├── .env                               # Local secrets (not committed)

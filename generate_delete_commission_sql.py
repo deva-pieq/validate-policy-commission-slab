@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Raw DELETE SQL for policy_commission (agency_id=5).
+Raw DELETE SQL for mismatched policy_commission rows (agency_id=5).
 
-Usage (file from --file, positional, or UPLOAD_FILE_PATH in .env):
-  python generate_delete_commission_sql.py --file Files
-  python generate_delete_commission_sql.py --file "Files/foo.csv"
-  python generate_delete_commission_sql.py   # uses UPLOAD_FILE_PATH from .env
+The validation run writes this file. It deletes by policy_commission.uuid for
+slabs that do not match the sheet. Policies whose slabs all match are omitted.
+Missing slabs have no row to delete.
 
-Does NOT run DELETE. Optional read-only COUNT preview only.
+Does NOT run DELETE.
 Output is raw SQL only (.sql): BEGIN / DELETE / ROLLBACK.
 """
 
@@ -15,8 +14,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from typing import List, Optional, Set
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 from validate_policy_commission_db import (
     DatabaseManager,
@@ -86,6 +90,50 @@ def build_match_numbers(policy_numbers: List[str]) -> List[str]:
     return out
 
 
+def mismatch_commission_uuids(mismatch_payloads: List[dict]) -> List[str]:
+    """Commission row ids that failed the sheet compare and will be recreated."""
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for payload in mismatch_payloads or []:
+        uid = str((payload or {}).get("rule_uuid") or "").strip()
+        if not _UUID_RE.match(uid) or uid.lower() in seen:
+            continue
+        seen.add(uid.lower())
+        ordered.append(uid)
+    return ordered
+
+
+def sql_uuid_array(values: List[str], indent: str = "    ") -> str:
+    if not values:
+        return "ARRAY[]::uuid[]"
+    lines = [f"{indent}'{v}'" for v in values]
+    return "ARRAY[\n" + ",\n".join(lines) + "\n]::uuid[]"
+
+
+def write_mismatch_delete_sql(
+    out_path: str,
+    agency_id: int,
+    commission_uuids: List[str],
+) -> str:
+    """DELETE only the given policy_commission.uuid rows. Matched slabs are not listed."""
+    safe_ids = [v for v in commission_uuids if _UUID_RE.match(str(v).strip())]
+    array_sql = sql_uuid_array(safe_ids)
+    body = f"""BEGIN;
+
+DELETE FROM policy_commission
+WHERE agency_id = {int(agency_id)}
+  AND uuid = ANY(
+{array_sql}
+  );
+
+ROLLBACK;
+"""
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(body)
+    return os.path.abspath(out_path)
+
+
 def write_raw_delete_sql_md(
     out_path: str,
     agency_id: int,
@@ -105,7 +153,7 @@ WHERE pc.policy_uuid = p.uuid
   AND p.number = ANY(
 {array_sql}
   );
-
+COMMIT;
 ROLLBACK;
 """
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
@@ -120,6 +168,10 @@ def write_delete_md_for_file(
     agency_id: int = 5,
     out_path: str = "docs/delete_commission_agency5.sql",
 ) -> str:
+    """Delete every commission row for policy numbers on the sheet.
+
+    The validation gate does not call this. Use write_mismatch_delete_sql.
+    """
     df = load_file(input_path)
     sheet_policies = extract_policy_numbers(df)
     match_numbers = build_match_numbers(sheet_policies)
@@ -163,67 +215,34 @@ def run_db_preview(db_mgr: DatabaseManager, agency_id: int, match_numbers: List[
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Write raw DELETE SQL markdown for policy_commission"
+        description="Delete SQL is written by the validator for mismatched commission rows only."
     )
     parser.add_argument(
         "file_path",
         nargs="?",
         default=None,
-        help="Optional positional path (same as --file / UPLOAD_FILE_PATH)",
+        help="Unused. Policy numbers on the sheet are not a delete list.",
     )
-    parser.add_argument("--file", type=str, default=None, help="Sheet CSV/Excel path or directory")
+    parser.add_argument("--file", type=str, default=None, help="Unused. Kept so old commands fail clearly.")
     parser.add_argument("--env-file", type=str, default=".env")
     parser.add_argument("--agency-id", type=int, default=5)
     parser.add_argument(
         "--out",
         type=str,
         default="docs/delete_commission_agency5.sql",
-        help="Output .sql path",
+        help="Output path written by validate_policy_commission_db.py",
     )
     parser.add_argument(
         "--skip-db-preview",
         action="store_true",
-        help="Do not connect for COUNT preview",
+        help="Unused. This script no longer previews a policy-wide delete.",
     )
-    args = parser.parse_args()
-
-    load_env_file(args.env_file, override=True)
-    agency_id = int(os.getenv("AGENCY_ID", args.agency_id))
-
-    input_path = args.file or args.file_path or os.getenv("UPLOAD_FILE_PATH")
-    if not input_path or not os.path.exists(input_path):
-        print("Provide file via --file or UPLOAD_FILE_PATH in .env")
-        print(f"Input not found: {input_path!r}")
-        return 1
-
-    print(f"Source: {input_path}")
-    print(f"Agency ID: {agency_id}")
-    print("DELETE is NOT executed by this script.")
-
-    df = load_file(input_path)
-    sheet_policies = extract_policy_numbers(df)
-    match_numbers = build_match_numbers(sheet_policies)
-    print(f"Sheet policies: {len(sheet_policies):,} | Match candidates: {len(match_numbers):,}")
-
-    if not args.skip_db_preview:
-        db_mgr = DatabaseManager()
-        if db_mgr.connect():
-            preview = run_db_preview(db_mgr, agency_id, match_numbers)
-            if preview:
-                print(f"Commission rows to delete: {preview['commission_count']:,}")
-                print(f"Distinct policies with commission: {preview['distinct_pol_with_comm']:,}")
-            db_mgr.close()
-
-    abs_out = write_raw_delete_sql_md(
-        out_path=args.out,
-        agency_id=agency_id,
-        match_numbers=match_numbers,
-        source_label=os.path.abspath(input_path),
-        sheet_policy_count=len(sheet_policies),
-    )
-    print(f"Wrote: {abs_out}")
-    print("Share .sql with senior eng. After DELETE + remaining=0, re-run validator with --force-post-mismatches.")
-    return 0
+    parser.parse_args()
+    print("This script no longer deletes every policy on the sheet.")
+    print("A policy whose slabs all match is left out. A mixed policy deletes only the mismatched commission row.")
+    print("Run the validator. It writes delete_commission_agency5.sql from those mismatched row ids:")
+    print("  python validate_policy_commission_db.py")
+    return 2
 
 
 if __name__ == "__main__":

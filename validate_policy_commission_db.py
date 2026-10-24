@@ -4381,9 +4381,10 @@ def main():
 
     # ------------------------------------------------------------------
     # FLOW: delete SQL -> approve -> POST recreate (no PUT)
-    #   1) Write delete MD (missing + mismatch policies from this file)
+    #   1) Write DELETE for mismatched policy_commission.uuid values only
     #   2) Wait for human: delete done / remaining=0
-    #   3) On y: auto-POST all create payloads (strip old rule_uuid)
+    #   3) On y: auto-POST missing + mismatch create payloads (strip old rule_uuid)
+    # Matched slabs are not in the DELETE and are not posted.
     # ------------------------------------------------------------------
     post_payloads = list(unique_missing_payloads or []) + list(unique_mismatch_payloads or [])
     # Dedupe by (policyUuid, monthFrom, monthTo, commissionType)
@@ -4413,32 +4414,58 @@ def main():
             print("\n" + "=" * 80)
             print("FLOW STEP 1/2 — DELETE GATE (share SQL with senior eng)")
             print("=" * 80)
-            print(f"Policies needing recreate after delete: {len(post_payloads)} rule payload(s)")
-            print(f"  - missing in DB : {len(unique_missing_payloads or [])}")
-            print(f"  - mismatch vs DB: {len(unique_mismatch_payloads or [])}")
+            from generate_delete_commission_sql import (
+                mismatch_commission_uuids,
+                write_mismatch_delete_sql,
+            )
+
+            mismatch_uuids = mismatch_commission_uuids(unique_mismatch_payloads)
+            invalid_mismatch_rows = [
+                p for p in (invalid_user_uuid_payloads or []) if str(p.get("rule_uuid") or "").strip()
+            ]
+            print(f"Rules to create after the delete step: {len(post_payloads)}")
+            print(f"  - missing in DB (no delete): {len(unique_missing_payloads or [])}")
+            print(f"  - mismatch rows to delete:   {len(mismatch_uuids)}")
+            print("  - matched slabs are omitted from the DELETE and are not posted")
+            if invalid_mismatch_rows:
+                print(
+                    f"  - mismatch rows left in place (split checks failed, so they are not deleted): "
+                    f"{len(invalid_mismatch_rows)}"
+                )
             delete_md_path = os.path.join(output_dir, "delete_commission_agency5.sql")
             docs_md_path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), "docs", "delete_commission_agency5.sql"
             )
             try:
-                from generate_delete_commission_sql import write_delete_md_for_file
-
-                abs_delete = write_delete_md_for_file(
-                    input_path=input_file, agency_id=agency_id, out_path=delete_md_path
+                abs_delete = write_mismatch_delete_sql(
+                    out_path=delete_md_path,
+                    agency_id=agency_id,
+                    commission_uuids=mismatch_uuids,
                 )
                 try:
-                    write_delete_md_for_file(input_file, agency_id=agency_id, out_path=docs_md_path)
+                    write_mismatch_delete_sql(
+                        out_path=docs_md_path,
+                        agency_id=agency_id,
+                        commission_uuids=mismatch_uuids,
+                    )
                 except Exception:
                     pass
-                print(f"Raw delete SQL MD: {abs_delete}")
+                print(f"Raw delete SQL: {abs_delete}")
                 print("Share with senior eng. Script does NOT run DELETE.")
             except Exception as de:
-                print(f"⚠️ Could not write delete SQL MD: {de}")
+                print(f"⚠️ Could not write delete SQL: {de}")
 
-            confirm_del = input(
-                "\nFLOW STEP 2/2 — Delete completed and remaining=0?\n"
-                "Type 'y' to AUTO-POST all commission rules now (n to stop): "
-            ).strip().lower()
+            if mismatch_uuids:
+                confirm_prompt = (
+                    "\nFLOW STEP 2/2 — Mismatch rows deleted and remaining=0?\n"
+                    "Type 'y' to AUTO-POST missing and mismatch rules now (n to stop): "
+                )
+            else:
+                confirm_prompt = (
+                    "\nFLOW STEP 2/2 — No mismatch rows to delete.\n"
+                    "Type 'y' to AUTO-POST missing rules now (n to stop): "
+                )
+            confirm_del = input(confirm_prompt).strip().lower()
             delete_approved = confirm_del in ("y", "yes")
 
         if delete_approved:
