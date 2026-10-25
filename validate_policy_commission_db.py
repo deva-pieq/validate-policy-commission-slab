@@ -712,6 +712,149 @@ def fix_inclusive_month_band_overlaps(df: pd.DataFrame) -> Tuple[pd.DataFrame, d
     return df_out, {"rows_fixed": rows_fixed, "examples": examples}
 
 
+def _is_blank_contract(val: Any) -> bool:
+    """True when Contract was left empty on a continuation month band."""
+    if val is None:
+        return True
+    try:
+        if pd.isna(val):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(val).strip().lower() in ("", "nan", "none", "null")
+
+
+def _person_token(val: Any) -> str:
+    """Agent id with quotes removed. Keeps an SL suffix so Agent and Sales Leader stay distinct."""
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    token = str(val).strip().strip("'\"").upper()
+    if token.endswith(".0") and token[:-2].isdigit():
+        token = token[:-2]
+    return token
+
+
+def _sequence_token(val: Any) -> str:
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(val).strip()
+    if text.lower() in ("", "nan", "none", "null"):
+        return ""
+    try:
+        return str(int(float(text)))
+    except (TypeError, ValueError):
+        return text.upper()
+
+
+def _inferred_contract(agent_id: Any, agent_name: Any) -> Optional[str]:
+    """Role for a blank Contract, using the person rather than the empty cell.
+
+    Main Line Benefits is Agency. An agent id ending in SL is the Sales Leader.
+    The writing agent is whoever is left.
+    """
+    name = ""
+    if agent_name is not None:
+        try:
+            blank_name = pd.isna(agent_name)
+        except (TypeError, ValueError):
+            blank_name = False
+        if not blank_name:
+            name = " ".join(str(agent_name).strip().lower().split())
+    if "main line" in name or name in ("mlb", "mlb parallel run"):
+        return "Agency"
+    if _person_token(agent_id).endswith("SL"):
+        return "Sales Leader"
+    return None
+
+
+def fill_blank_contracts_from_siblings(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill a blank Contract from the same person, or from their id and name.
+
+    Sheets often fill Contract only on the first band, or leave it empty on every
+    band. A blank contract is classified as one role, so year-band normalize keeps
+    a single row and Stage 1 then reports that band as an invalid 1-row split.
+    """
+    if df is None or df.empty:
+        return df
+
+    df_out = df.copy()
+    pol_col = _find_col(df_out, ("policy no", "policy number", "policy", "policyno", "policy_number"))
+    prod_col = _find_col(df_out, ("product", "product name", "product_description", "product_name"))
+    contract_col = _find_col(df_out, ("contract", "level", "role"))
+    agent_col = _find_col(df_out, ("agent id", "agent_id", "agentid"))
+    name_col = next(
+        (c for c in df_out.columns if "agent name" in str(c).strip().lower() or str(c).strip().lower() == "agent_name"),
+        None,
+    )
+    seq_col = _find_col(df_out, ("sequence", "seq"))
+    fm_col = _find_col(df_out, ("from month", "from_month", "month", "month from", "month_from"))
+    if not contract_col or not pol_col:
+        return df_out
+    df_out[contract_col] = df_out[contract_col].astype("object")
+
+    known: Dict[Tuple[str, str, str, str], Tuple[int, Any]] = {}
+    for _, row in df_out.iterrows():
+        if _is_blank_contract(row.get(contract_col)):
+            continue
+        key = (
+            str(row.get(pol_col, "")).strip().strip("'\"").upper(),
+            str(row.get(prod_col, "")).strip().upper() if prod_col else "",
+            _person_token(row.get(agent_col)) if agent_col else "",
+            _sequence_token(row.get(seq_col)) if seq_col else "",
+        )
+        from_month = _month_to_int(row.get(fm_col)) if fm_col else 0
+        previous = known.get(key)
+        if previous is None or from_month < previous[0]:
+            known[key] = (from_month, row.get(contract_col))
+
+    def _row_key(row: pd.Series) -> Tuple[str, str, str, str]:
+        return (
+            str(row.get(pol_col, "")).strip().strip("'\"").upper(),
+            str(row.get(prod_col, "")).strip().upper() if prod_col else "",
+            _person_token(row.get(agent_col)) if agent_col else "",
+            _sequence_token(row.get(seq_col)) if seq_col else "",
+        )
+
+    for idx, row in df_out.iterrows():
+        if not _is_blank_contract(row.get(contract_col)):
+            continue
+        hit = known.get(_row_key(row))
+        if hit is not None:
+            df_out.at[idx, contract_col] = hit[1]
+            continue
+        inferred = _inferred_contract(
+            row.get(agent_col) if agent_col else "",
+            row.get(name_col) if name_col else "",
+        )
+        if inferred:
+            df_out.at[idx, contract_col] = inferred
+
+    # One remaining blank person on the policy is the writing agent.
+    leftovers: Dict[Tuple[str, str], Set[str]] = {}
+    for _, row in df_out.iterrows():
+        if not _is_blank_contract(row.get(contract_col)):
+            continue
+        pol_prod = _row_key(row)[:2]
+        leftovers.setdefault(pol_prod, set()).add(_row_key(row)[2])
+    single_agent = {pol_prod for pol_prod, people in leftovers.items() if len(people) == 1 and "" not in people}
+    for idx, row in df_out.iterrows():
+        if not _is_blank_contract(row.get(contract_col)):
+            continue
+        if _row_key(row)[:2] in single_agent:
+            df_out.at[idx, contract_col] = "Agent"
+    return df_out
+
+
 def normalize_year_bands(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     """
     Re-slice From-To so every role shares the finest common month bands for a policy+product.
@@ -721,6 +864,8 @@ def normalize_year_bands(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     """
     if df is None or df.empty:
         return df, {"groups_touched": 0, "rows_in": 0, "rows_out": 0}
+
+    df = fill_blank_contracts_from_siblings(df)
 
     pol_col = _find_col(df, ("policy no", "policy number", "policy", "policyno", "policy_number"))
     prod_col = _find_col(df, ("product", "product name", "product_description", "product_name"))

@@ -488,5 +488,37 @@ class TestSubAgentCommissionFixes(unittest.TestCase):
         self.assertEqual(len(df_matched), 3)
 
 
+    def test_blank_contract_continuation_keeps_three_splits(self):
+        """Later bands with a blank Contract must keep Agent, Sales Leader, and Agency."""
+        df = pd.DataFrame([
+            {"Policy No": "685711160", "Product": "NCD MetLife -24%", "From Month": 1, "To Month": 12, "Contract": "LVL5", "Sequence": 1, "Agent ID": "'17425766", "Rate": "17.76%"},
+            {"Policy No": "685711160", "Product": "NCD MetLife -24%", "From Month": 13, "To Month": 60, "Contract": None, "Sequence": 1, "Agent ID": "'17425766", "Rate": "15.84%"},
+            {"Policy No": "685711160", "Product": "NCD MetLife -24%", "From Month": 1, "To Month": 12, "Contract": "Sales Leader", "Sequence": 2, "Agent ID": "'17425766SL", "Rate": "19.72%"},
+            {"Policy No": "685711160", "Product": "NCD MetLife -24%", "From Month": 13, "To Month": 60, "Contract": None, "Sequence": 2, "Agent ID": "'17425766SL", "Rate": "17.52%"},
+            {"Policy No": "685711160", "Product": "NCD MetLife -24%", "From Month": 1, "To Month": 12, "Contract": "Agency", "Sequence": 3, "Agent ID": "'20411454", "Rate": "24.00%"},
+            {"Policy No": "685711160", "Product": "NCD MetLife -24%", "From Month": 13, "To Month": 60, "Contract": None, "Sequence": 3, "Agent ID": "'20411454", "Rate": "24.00%"},
+        ])
+        out, _ = normalize_year_bands(df)
+        band = out[out["From Month"].astype(int) == 13]
+        self.assertEqual(len(band), 3)
+        roles = sorted(classify_contract_role(c) for c in band["Contract"])
+        self.assertEqual(roles, ["agency", "agent", "sales_leader"])
+
+    def test_all_blank_contracts_keep_three_people(self):
+        """A sheet with no Contract at all still keeps Agent, Sales Leader, and Agency."""
+        df = pd.DataFrame([
+            {"Policy No": "970060", "Product": "Sunlife", "From Month": 1, "To Month": 12, "Contract": None, "Sequence": 1, "Agent ID": "'8244481", "Agent Name": "PAMELA  DEATON", "Rate": "10.92%"},
+            {"Policy No": "970060", "Product": "Sunlife", "From Month": 13, "To Month": 0, "Contract": None, "Sequence": 1, "Agent ID": "'8244481", "Agent Name": "PAMELA  DEATON", "Rate": "10.92%"},
+            {"Policy No": "970060", "Product": "Sunlife", "From Month": 1, "To Month": 12, "Contract": None, "Sequence": 2, "Agent ID": "'7146581SL", "Agent Name": "ANTHONY  HUNSBERGER", "Rate": "11.83%"},
+            {"Policy No": "970060", "Product": "Sunlife", "From Month": 13, "To Month": 0, "Contract": None, "Sequence": 2, "Agent ID": "'7146581SL", "Agent Name": "ANTHONY  HUNSBERGER", "Rate": "11.31%"},
+            {"Policy No": "970060", "Product": "Sunlife", "From Month": 1, "To Month": 12, "Contract": None, "Sequence": 3, "Agent ID": "'20411454", "Agent Name": "MAIN LINE  BENEFITS", "Rate": "13.00%"},
+            {"Policy No": "970060", "Product": "Sunlife", "From Month": 13, "To Month": 0, "Contract": None, "Sequence": 3, "Agent ID": "'20411454", "Agent Name": "MAIN LINE  BENEFITS", "Rate": "13.00%"},
+        ])
+        out, summary = normalize_year_bands(df)
+        self.assertEqual(summary["rows_out"], 6)
+        roles = sorted(classify_contract_role(c) for c in out["Contract"])
+        self.assertEqual(roles, ["agency", "agency", "agent", "agent", "sales_leader", "sales_leader"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
