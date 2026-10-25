@@ -155,6 +155,94 @@ def classify_contract_role(contract_val: Any) -> str:
     return "Agent"
 
 
+def _month_number(val: Any, default: int) -> int:
+    """Sheet 0 and database NULL both mean an open-ended month."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return default
+    text = str(val).strip()
+    if not text or text.lower() in ("none", "null", "nan"):
+        return default
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return default
+
+
+def _band_key(month_from: Any, month_to: Any) -> Tuple[int, int]:
+    return (_month_number(month_from, 1), _month_number(month_to, 0))
+
+
+def _read_apl_field(row: Dict[str, Any], *names: str) -> Any:
+    lowered = {str(k).strip().lower(): v for k, v in row.items()}
+    for name in names:
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    return None
+
+
+def _prepared_apl_rows(apl_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Align sheet rows with the slabs the importer actually stored.
+
+    Open ranges such as Agency 13-0 are sliced to 13-60, 61-120, and 121-0
+    before the sequence roll-up, matching normalize_year_bands + rollup.
+    """
+    if not apl_records:
+        return []
+    has_share = any(_read_apl_field(row, "Normalized_Split_Share_%") not in (None, "") for row in apl_records)
+    has_month = any(_read_apl_field(row, "From Month", "from_month", "month from") not in (None, "") for row in apl_records)
+    if has_share or not has_month:
+        prepared = []
+        for row in apl_records:
+            item = dict(row)
+            item["_split_share"] = parse_float_safe(
+                _read_apl_field(row, "Normalized_Split_Share_%", "Rate", "Rate %", "rate"),
+                0.0,
+            )
+            prepared.append(item)
+        return prepared
+
+    frame = pd.DataFrame(apl_records)
+    rate_col = next((c for c in frame.columns if str(c).strip().lower() in ("rate", "rate %", "commission %")), None)
+    if rate_col:
+        frame["_raw_rate"] = frame[rate_col]
+    try:
+        from validate_policy_commission_db import (
+            fix_inclusive_month_band_overlaps,
+            normalize_year_bands,
+            rollup_commission_splits,
+        )
+        fixed, _ = fix_inclusive_month_band_overlaps(frame)
+        sliced, _ = normalize_year_bands(fixed)
+        rolled = rollup_commission_splits(sliced)
+    except Exception:
+        rolled = frame
+        rolled["_split_share"] = [
+            parse_float_safe(_read_apl_field(row, "Rate", "Rate %", "rate"), 0.0)
+            for row in apl_records
+        ]
+        return rolled.to_dict(orient="records")
+
+    if "Normalized_Split_Share_%" in rolled.columns:
+        rolled["_split_share"] = rolled["Normalized_Split_Share_%"]
+    else:
+        rolled["_split_share"] = 0.0
+    return rolled.to_dict(orient="records")
+
+
+def _db_splits_for_record(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cs = record.get("commission_split")
+    if isinstance(cs, list):
+        return [item for item in cs if isinstance(item, dict)]
+    if isinstance(cs, str):
+        try:
+            parsed = json.loads(cs)
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+        except Exception:
+            return []
+    return []
+
+
 def parse_float_safe(val: Any, default: float = 0.0) -> float:
     """Parses numeric string or number into float safely."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -169,10 +257,18 @@ def parse_float_safe(val: Any, default: float = 0.0) -> float:
 
 
 def compare_decimals(val1: Any, val2: Any, tolerance: float = 0.01) -> bool:
-    """Compares two numeric values within a defined decimal tolerance."""
+    """Compares two numeric values within a defined decimal tolerance.
+
+    Comparison is done in integer cents. Floor-rounding a split can leave a
+    one-cent gap (65.99 vs 66.00). A raw float subtract of that pair is
+    slightly above 0.01, so a 0.01 tolerance would reject a match.
+    """
     f1 = parse_float_safe(val1, 0.0)
     f2 = parse_float_safe(val2, 0.0)
-    return abs(f1 - f2) <= tolerance
+    cents_1 = int(round(f1 * 100))
+    cents_2 = int(round(f2 * 100))
+    allowed = int(round(tolerance * 100))
+    return abs(cents_1 - cents_2) <= allowed
 
 
 def clean_name_ignoring_id(name: Any) -> str:
@@ -265,7 +361,7 @@ def compare_levels(apl_contract_or_lvl: Any, db_lvl: Any, role: str = "") -> Dic
             "disp": f"MATCH ({norm_db or 'Agent'})",
         }
 
-    # Direct canonical match (e.g. 'Level 5' == 'Level 5', 'SA1' == 'SA1')
+    # Direct canonical match (e.g. 'LVL5' == 'Level 5', 'SA1' == 'SA1')
     if norm_apl and norm_db and norm_apl.lower() == norm_db.lower():
         return {
             "match": True,
@@ -1205,59 +1301,87 @@ def validate_policy_records(
         })
 
     # Commission Splits Comparison
-    # Collect all split items across DB records
-    db_splits: List[Dict[str, Any]] = []
-    for dbr in db_records:
-        cs = dbr.get("commission_split")
-        if isinstance(cs, list):
-            db_splits.extend(cs)
-        elif isinstance(cs, str):
-            try:
-                parsed = json.loads(cs)
-                if isinstance(parsed, list):
-                    db_splits.extend(parsed)
-            except Exception:
-                pass
-
-    # Group APL rows into unique participant roles
-    apl_participants: List[Dict[str, Any]] = []
-    for r in apl_records:
-        role = classify_contract_role(r.get("Contract") or r.get("contract"))
-        name = str(r.get("Agent Name") or r.get("agent_name") or "").strip()
-        code = clean_agent_code(r.get("Agent ID") or r.get("agent_id") or "")
-        rate = parse_float_safe(r.get("Rate") or r.get("Rate %") or r.get("rate") or 0.0)
-        seq = int(r.get("Sequence") or 0)
-        contract = r.get("Contract") or r.get("contract") or ""
-        lvl_raw = r.get("Level") or r.get("level") or contract
-        lvl = normalize_level(lvl_raw)
-        apl_participants.append({
+    # One sheet month band against the commission row for that same band.
+    # The stored value is the roll-up share, not the raw Rate column.
+    prepared_rows = _prepared_apl_rows(apl_records)
+    bands: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    band_order: List[Tuple[int, int]] = []
+    for r in prepared_rows:
+        role = classify_contract_role(_read_apl_field(r, "Contract", "contract"))
+        name = str(_read_apl_field(r, "Agent Name", "agent_name") or "").strip()
+        code = clean_agent_code(_read_apl_field(r, "Agent ID", "agent_id") or "")
+        raw_rate = parse_float_safe(r.get("_raw_rate") if r.get("_raw_rate") not in (None, "") else _read_apl_field(r, "Rate", "Rate %", "rate"), 0.0)
+        try:
+            seq = int(float(_read_apl_field(r, "Sequence", "sequence") or 0))
+        except (TypeError, ValueError):
+            seq = 0
+        contract = _read_apl_field(r, "Contract", "contract") or ""
+        lvl_raw = _read_apl_field(r, "Level", "level") or contract
+        band = _band_key(
+            _read_apl_field(r, "From Month", "from_month", "month from"),
+            _read_apl_field(r, "To Month", "to_month", "month to"),
+        )
+        if band not in bands:
+            band_order.append(band)
+            bands[band] = []
+        bands[band].append({
             "role": role,
-            "level": lvl,
+            "level": normalize_level(lvl_raw),
             "name": name,
             "code": code,
-            "rate": rate,
+            "rate": raw_rate,
+            "share": parse_float_safe(r.get("_split_share"), raw_rate),
             "sequence": seq,
+            "band": band,
         })
 
-    # Sort APL participants by role hierarchy
-    role_order = {"Agency": 1, "Sales Leader": 2, "Agent": 3, "Sub Agent": 4}
-    apl_participants.sort(key=lambda x: (role_order.get(x["role"], 99), -x["sequence"]))
+    db_by_band: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    db_rules_with_splits = [rec for rec in db_records if _db_splits_for_record(rec)]
+    for rec in db_rules_with_splits:
+        db_by_band.setdefault(_band_key(rec.get("month_from"), rec.get("month_to")), []).extend(
+            _db_splits_for_record(rec)
+        )
+    # Sheets with no month columns are one band. Use every split on the policy.
+    if len(band_order) == 1 and band_order[0] == (1, 0) and not any(
+        _read_apl_field(r, "From Month", "from_month", "month from") not in (None, "") for r in apl_records
+    ):
+        db_by_band = {(1, 0): [s for rec in db_rules_with_splits for s in _db_splits_for_record(rec)]}
 
-    # Compare each APL split against DB splits
+    role_order = {"Agency": 1, "Sales Leader": 2, "Agent": 3, "Sub Agent": 4}
+    apl_participants: List[Dict[str, Any]] = []
+    for band in band_order:
+        people = bands[band]
+        people.sort(key=lambda x: (role_order.get(x["role"], 99), -x["sequence"]))
+        apl_participants.extend(people)
+
+    # Compare each APL split against the database split in the same month band
     for idx, p_apl in enumerate(apl_participants, 1):
         target_role = p_apl["role"]
-        # Find matching DB split by role and/or participant identity
+        db_splits = db_by_band.get(p_apl["band"], [])
         matched_db_split = None
-        for s in db_splits:
-            s_role = str(s.get("role") or "").strip()
-            if s_role.lower() == target_role.lower():
-                matched_db_split = s
-                break
+        role_hits = [
+            s for s in db_splits
+            if str(s.get("role") or "").strip().lower() == target_role.lower()
+        ]
+        if len(role_hits) == 1:
+            matched_db_split = role_hits[0]
+        elif role_hits:
+            apl_name_key = " ".join(clean_name_ignoring_id(p_apl["name"]).casefold().split())
+            for s in role_hits:
+                db_name_key = " ".join(clean_name_ignoring_id(s.get("user_name")).casefold().split())
+                if apl_name_key and apl_name_key == db_name_key:
+                    matched_db_split = s
+                    break
+            if matched_db_split is None:
+                matched_db_split = role_hits[0]
 
-        if not matched_db_split and db_splits:
-            # Fallback by order index if role didn't match directly
-            if idx <= len(db_splits):
-                matched_db_split = db_splits[idx - 1]
+        if matched_db_split is None and db_splits and not role_hits:
+            same_order = [
+                s for s in db_splits
+                if str(s.get("order") or "") == str(role_order.get(target_role, idx))
+            ]
+            if len(same_order) == 1:
+                matched_db_split = same_order[0]
 
         if matched_db_split:
             db_role = str(matched_db_split.get("role") or "").strip()
@@ -1273,7 +1397,7 @@ def validate_policy_records(
 
             # Check role match
             role_matches = db_role.lower() == target_role.lower()
-            val_matches = compare_decimals(p_apl["rate"], db_val, tolerance=0.01)
+            val_matches = compare_decimals(p_apl["share"], db_val, tolerance=0.02)
 
             # Check level match if level was specified in DB split
             if db_level:
@@ -1289,7 +1413,11 @@ def validate_policy_records(
             if db_level and not level_matches:
                 split_diffs.append(f"Level mismatch ({lvl_cmp['disp']})")
             if not val_matches:
-                split_diffs.append(f"Rate mismatch ({p_apl['rate']}% vs {db_val}%)")
+                fm, tm = p_apl["band"]
+                split_diffs.append(
+                    f"Months {fm}-{tm} split mismatch "
+                    f"(sheet rate {p_apl['rate']}% → share {p_apl['share']}% vs DB {db_val}%)"
+                )
             if p_match_st not in ("EXACT_MATCH", "NORMALIZED_MATCH"):
                 split_diffs.append(f"Name mismatch ({p_name_res['reason']})")
             if not db_uuid and target_role != "Agency":
@@ -1317,7 +1445,7 @@ def validate_policy_records(
                 "db_order": db_order,
                 "apl_uuid": "",
                 "db_uuid": db_uuid,
-                "apl_commission_value": p_apl["rate"],
+                "apl_commission_value": p_apl["share"],
                 "db_commission_value": db_val,
                 "participant_match_status": p_match_st,
                 "field_comparison_result": sp_status,
@@ -1338,12 +1466,15 @@ def validate_policy_records(
                 "db_order": None,
                 "apl_uuid": "",
                 "db_uuid": "",
-                "apl_commission_value": p_apl["rate"],
+                "apl_commission_value": p_apl["share"],
                 "db_commission_value": 0.0,
                 "participant_match_status": "MISSING_IN_DB",
                 "field_comparison_result": "DATA_MISMATCH",
                 "review_required": True,
-                "review_reason": f"Split role '{target_role}' completely missing from DB commission splits",
+                "review_reason": (
+                    f"Months {p_apl['band'][0]}-{p_apl['band'][1]} "
+                    f"role '{target_role}' is missing from that commission slab"
+                ),
             })
 
     # Determine overall data validation status
@@ -1466,6 +1597,12 @@ def annotate_apl_rows(
     rate_col = next((c for c in df_out.columns if "rate" in str(c).lower()), "Rate")
     amt_col = next((c for c in df_out.columns if "amount" in str(c).lower()), "Amount")
 
+    try:
+        from validate_policy_commission_db import fill_blank_contracts_from_siblings
+        df_filled_contracts = fill_blank_contracts_from_siblings(df_out)
+    except Exception:
+        df_filled_contracts = df_out
+
     month_matches = []
     rate_matches = []
     role_matches = []
@@ -1502,8 +1639,15 @@ def annotate_apl_rows(
         pol_clean = clean_policy_number(pol_raw)
         agent_name = clean_name_ignoring_id(row.get(agent_col))
         agent_id = str(row.get(id_col) or "").strip()
-        contract = str(row.get(contract_col) or "").strip()
+        contract_cell = row.get(contract_col)
+        if contract_col in df_filled_contracts.columns and idx in df_filled_contracts.index:
+            contract_cell = df_filled_contracts.at[idx, contract_col]
+        contract = "" if contract_cell is None or (isinstance(contract_cell, float) and pd.isna(contract_cell)) else str(contract_cell).strip()
+        if contract.lower() in ("nan", "none", "null"):
+            contract = ""
         raw_level = str(row.get(level_col) or "").strip() if level_col else contract
+        if raw_level.lower() in ("nan", "none", "null"):
+            raw_level = contract
         role = classify_contract_role(contract)
         fm_raw = row.get(from_col)
         tm_raw = row.get(to_col)
@@ -1735,7 +1879,10 @@ def annotate_apl_rows(
         elif val_rollup_ok:
             rate_str = f"MATCH ({db_val:.2f}% [Rollup: {rollup_val:.2f}%])"
         else:
-            rate_str = f"MISMATCH (File: {rate_raw} vs DB: {db_val:.2f}%)"
+            if abs(rollup_val - rate_val) > 0.001:
+                rate_str = f"MISMATCH (File: {rate_raw} → share {rollup_val:.2f}% vs DB: {db_val:.2f}%)"
+            else:
+                rate_str = f"MISMATCH (File: {rate_raw} vs DB: {db_val:.2f}%)"
 
         matched_items = [f"Policy No ({pol_match.get('status', 'EXACT_MATCH')})", f"Month Slab ({db_tier_disp})"]
         mismatches = []

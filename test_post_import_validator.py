@@ -272,6 +272,9 @@ class TestPostImportValidator(unittest.TestCase):
     def test_28_decimal_precision(self):
         self.assertTrue(compare_decimals(100.004, 100.00, tolerance=0.01))
         self.assertFalse(compare_decimals(100.05, 100.00, tolerance=0.01))
+        # Floor-rounded rollup shares sit one cent from the stored split.
+        self.assertTrue(compare_decimals(65.99, 66.00, tolerance=0.01))
+        self.assertTrue(compare_decimals(27.01, 27.00, tolerance=0.01))
 
     def test_29_month_boundary_normalization(self):
         from validate_apl_vs_db_after_import import clean_policy_number
@@ -509,10 +512,12 @@ class TestPostImportValidator(unittest.TestCase):
         self.assertTrue(compare_levels("Sales Leader", "Sales Leader", "Sales Leader")["match"])
         self.assertTrue(compare_levels("Sales Leader", None, "Sales Leader")["match"])
 
-        # Test zero-compromise mismatches
-        res_mismatch = compare_levels("LVL5", "Level 2", "Agent")
-        self.assertFalse(res_mismatch["match"])
-        self.assertIn("MISMATCH", res_mismatch["disp"])
+        # LVL5 is the contract grade Level 5, not the split slot.
+        for wrong_level in ("Level 1", "Level 2", "Level 4"):
+            res_mismatch = compare_levels("LVL5", wrong_level, "Agent")
+            self.assertFalse(res_mismatch["match"])
+            self.assertIn("MISMATCH", res_mismatch["disp"])
+            self.assertIn("Level 5", res_mismatch["disp"])
 
         res_sa_mismatch = compare_levels("SUBAGT1", "SA2", "Sub Agent")
         self.assertFalse(res_sa_mismatch["match"])
