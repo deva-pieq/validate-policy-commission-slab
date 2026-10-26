@@ -233,7 +233,8 @@ def policy_suffix_candidates(policy_number: str) -> List[str]:
     Tries, in order:
     - trailing alphabetic suffix removed (OVR, SL, and any other trailing letters)
     - short letter-led suffix removed (A8, K1, K67)
-    - a single trailing character removed
+    - one trailing character removed (8526429013 -> 852642901)
+    - two trailing characters removed, only if the one-character strip is not in the DB
     """
     pol = str(policy_number or "").strip().strip("'\"").strip()
     if not pol or pol.lower() == "nan":
@@ -243,18 +244,20 @@ def policy_suffix_candidates(policy_number: str) -> List[str]:
 
     def add(value: str) -> None:
         value = str(value or "").strip()
-        if value and value != pol and value not in found:
+        if value and value != pol and value not in found and len(value) >= 6:
             found.append(value)
 
     # Trailing letters, including a multi-letter suffix such as OVR or a single letter.
     add(re.sub(r"[A-Za-z]+$", "", pol))
     # Letter plus digits left on the end of a numeric policy number, such as A8, K1, or K67.
     token_stripped = re.sub(r"[A-Za-z]\d{1,3}$", "", pol)
-    if token_stripped.isdigit() and len(token_stripped) >= 6:
+    if token_stripped.isdigit():
         add(token_stripped)
-    # One trailing character, only when the value is not already a plain numeric policy number.
-    if len(pol) > 1 and not pol.isdigit():
+    # One character, then two. Includes a numeric suffix such as 8526429013 -> 852642901.
+    if len(pol) > 1:
         add(pol[:-1])
+    if len(pol) > 2:
+        add(pol[:-2])
     return found
 
 
@@ -857,7 +860,10 @@ def fill_blank_contracts_from_siblings(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_year_bands(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     """
-    Re-slice From-To so every role shares the finest common month bands for a policy+product.
+    Re-slice From-To so every person shares the finest common month bands for a policy+product.
+
+    Two people with the same role stay as two rows. StreetZA and StreetZC are both
+    agents; sequence 2 must not be dropped because sequence 1 is already an agent.
 
     Example: Agency 1-48 + SL/Agent 1-12 and 13-48
           -> Agency/SL/Agent for 1-12 and Agency/SL/Agent for 13-48.
@@ -872,23 +878,42 @@ def normalize_year_bands(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     fm_col = _find_col(df, ("from month", "from_month", "month", "month from", "month_from"))
     tm_col = _find_col(df, ("to month", "to_month", "month to", "month_to"))
     contract_col = _find_col(df, ("contract", "level", "role"))
+    seq_col = _find_col(df, ("sequence", "seq"))
+    agent_col = _find_col(df, ("agent id", "agent_id", "agentid"))
+    name_col = next(
+        (c for c in df.columns if "agent name" in str(c).strip().lower() or str(c).strip().lower() == "agent_name"),
+        None,
+    )
 
     if not all([pol_col, prod_col, fm_col, tm_col, contract_col]):
         print("⚠️ Year-band normalize skipped: missing Policy/Product/From/To/Contract columns.")
         return df.copy(), {"groups_touched": 0, "rows_in": len(df), "rows_out": len(df), "skipped": True}
 
+    def _person_key(row: pd.Series) -> Tuple[str, str, str]:
+        seq = _sequence_token(row.get(seq_col)) if seq_col else ""
+        agent = _person_token(row.get(agent_col)) if agent_col else ""
+        if not agent and name_col:
+            agent = " ".join(str(row.get(name_col) or "").split()).upper()
+        role = classify_contract_role(row.get(contract_col, ""))
+        return (seq, agent, role)
+
+    def _covers(row: pd.Series, b_start: int, b_end: int) -> bool:
+        start, end = _interval_bounds(row.get(fm_col), row.get(tm_col))
+        return start <= b_start and end >= b_end
+
     out_rows: List[dict] = []
     groups_touched = 0
-    ROLE_ORDER = ("agency", "sales_leader", "agent", "sub_agent")
 
     for (_, _), group in df.groupby([pol_col, prod_col], sort=False):
         cuts: Set[int] = set()
-        role_rows: Dict[str, List[pd.Series]] = {r: [] for r in ROLE_ORDER}
+        person_rows: Dict[Tuple[str, str, str], List[pd.Series]] = {}
+        person_order: List[Tuple[str, str, str]] = []
         for _, row in group.iterrows():
-            role = classify_contract_role(row.get(contract_col, ""))
-            if role not in role_rows:
-                role_rows[role] = []
-            role_rows[role].append(row)
+            key = _person_key(row)
+            if key not in person_rows:
+                person_rows[key] = []
+                person_order.append(key)
+            person_rows[key].append(row)
             start, end = _interval_bounds(row.get(fm_col), row.get(tm_col))
             cuts.add(start)
             if end < _OPEN_MONTH_SENTINEL:
@@ -900,10 +925,10 @@ def normalize_year_bands(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             continue
 
         cuts_sorted = sorted(cuts)
-        # Ensure open-ended coverage when any role uses To Month = 0
+        # Ensure open-ended coverage when any person uses To Month = 0
         has_open = any(
             _interval_bounds(r.get(fm_col), r.get(tm_col))[1] >= _OPEN_MONTH_SENTINEL
-            for rows in role_rows.values() for r in rows
+            for rows in person_rows.values() for r in rows
         )
         if has_open and (not cuts_sorted or cuts_sorted[-1] < _OPEN_MONTH_SENTINEL):
             cuts_sorted.append(_OPEN_MONTH_SENTINEL)
@@ -918,42 +943,25 @@ def normalize_year_bands(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
 
         # Detect whether slicing actually changes anything
         original_keys = {
-            (
-                classify_contract_role(r.get(contract_col, "")),
-                _month_to_int(r.get(fm_col)),
-                _month_to_int(r.get(tm_col)),
-            )
+            (_person_key(r), _month_to_int(r.get(fm_col)), _month_to_int(r.get(tm_col)))
             for _, r in group.iterrows()
         }
-        will_change = False
         preview_keys = set()
         for b_start, b_end in bands:
-            for role in ROLE_ORDER:
-                covering = [
-                    r for r in role_rows.get(role, [])
-                    if _interval_bounds(r.get(fm_col), r.get(tm_col))[0] <= b_start
-                    and _interval_bounds(r.get(fm_col), r.get(tm_col))[1] >= b_end
-                ]
-                if covering:
-                    fm_out, tm_out = _band_to_from_to(b_start, b_end)
-                    preview_keys.add((role, fm_out, tm_out))
+            fm_out, tm_out = _band_to_from_to(b_start, b_end)
+            for key, rows in person_rows.items():
+                if any(_covers(r, b_start, b_end) for r in rows):
+                    preview_keys.add((key, fm_out, tm_out))
         if preview_keys != original_keys:
-            will_change = True
-
-        if will_change:
             groups_touched += 1
 
         for b_start, b_end in bands:
             fm_out, tm_out = _band_to_from_to(b_start, b_end)
-            for role in ROLE_ORDER:
-                covering = [
-                    r for r in role_rows.get(role, [])
-                    if _interval_bounds(r.get(fm_col), r.get(tm_col))[0] <= b_start
-                    and _interval_bounds(r.get(fm_col), r.get(tm_col))[1] >= b_end
-                ]
+            for key in person_order:
+                covering = [r for r in person_rows[key] if _covers(r, b_start, b_end)]
                 if not covering:
                     continue
-                # Prefer the tightest covering interval, then first
+                # Prefer the tightest covering interval, then the first row for that person
                 covering.sort(
                     key=lambda r: (
                         _interval_bounds(r.get(fm_col), r.get(tm_col))[1]
@@ -2523,7 +2531,7 @@ def stage2_db_verify_dataset(
                 order = int(s.get("order"))
             except (TypeError, ValueError):
                 continue
-            if order >= best_order:
+            if order > best_order:
                 best_order = order
                 best = s
         return best
@@ -2612,21 +2620,26 @@ def stage2_db_verify_dataset(
             db_records = lookup_policy_db_records(chunk_db_map, pol_number, clean_prod_name)
             if not db_records and not is_mapped:
                 for candidate in policy_suffix_candidates(pol_number):
-                    alt_records = lookup_policy_db_records(chunk_db_map, candidate, clean_prod_name)
-                    if not alt_records:
-                        continue
-                    distinct_numbers = {str(r.get("policy_number", "")).strip() for r in alt_records}
-                    distinct_numbers.discard("")
-                    if len(distinct_numbers) > 1:
+                    candidate_rows = chunk_db_map.get(candidate) or []
+                    if not isinstance(candidate_rows, list):
+                        candidate_rows = []
+                    distinct_uuids = {
+                        str(r.get("policy_uuid") or "").strip()
+                        for r in candidate_rows
+                        if isinstance(r, dict)
+                    }
+                    distinct_uuids.discard("")
+                    if len(distinct_uuids) > 1:
                         is_ambiguous = True
                         ambiguous_reason = (
-                            f"Policy number '{pol_number}' matched multiple policies after removing the suffix "
-                            f"('{candidate}')."
+                            f"Policy number '{pol_number}' matched {len(distinct_uuids)} policies "
+                            f"after removing the suffix ('{candidate}'). Not updated."
                         )
                         db_records = []
                         break
-                    db_records = alt_records
-                    break
+                    if len(distinct_uuids) == 1:
+                        db_records = lookup_policy_db_records(chunk_db_map, candidate, clean_prod_name)
+                        break
 
             if not db_records and not is_ambiguous and not is_mapped and len(pol_number) > 11:
                 prefix = pol_number[:11]
@@ -2648,7 +2661,7 @@ def stage2_db_verify_dataset(
                 found_prod_uuid = db_mgr.get_product_uuid(agency_id, prod_name)
                 if not found_prod_uuid:
                     not_found_products.add(prod_name)
-            if not found_pol_uuid and found_prod_uuid and pol_number not in not_found_policies:
+            if not found_pol_uuid and found_prod_uuid and not is_ambiguous and pol_number not in not_found_policies:
                 lookup_numbers = [pol_number]
                 if not is_mapped:
                     lookup_numbers.extend(policy_suffix_candidates(pol_number))
@@ -3199,12 +3212,25 @@ def stage2_db_verify_dataset(
                                     # Preserve any extra DB split roles that were not present in the input file
                                     # (Do NOT preserve empty placeholder/dummy slots that have no agent assigned and 0% commission)
                                     file_roles = {_role_key_of(f) for f in file_commission_split}
+                                    file_people = set()
+                                    for f_split in file_commission_split:
+                                        f_code = clean_agent_code(str(f_split.get("user_code") or "").strip().lower())
+                                        f_name = _person_name_key(str(f_split.get("user_name") or ""))
+                                        if f_code:
+                                            file_people.add(("code", f_code))
+                                        if f_name:
+                                            file_people.add(("name", f_name))
                                     for db_idx, db_s in enumerate(db_splits_list):
-                                        if db_idx not in used_db_indices and _role_key_of(db_s) not in file_roles:
-                                            has_valid_uuid = bool(db_s.get("user_uuid"))
-                                            has_val = float(db_s.get("commission_value") or 0.0) > 0.0
-                                            if has_valid_uuid or has_val:
-                                                merged_splits.append(db_s.copy())
+                                        if db_idx in used_db_indices or _role_key_of(db_s) in file_roles:
+                                            continue
+                                        db_code = clean_agent_code(str(db_s.get("user_code") or "").strip().lower())
+                                        db_name = _person_name_key(str(db_s.get("user_name") or ""))
+                                        if (db_code and ("code", db_code) in file_people) or (db_name and ("name", db_name) in file_people):
+                                            continue
+                                        has_valid_uuid = bool(db_s.get("user_uuid"))
+                                        has_val = float(db_s.get("commission_value") or 0.0) > 0.0
+                                        if has_valid_uuid or has_val:
+                                            merged_splits.append(db_s.copy())
 
                                     # Override split-sum correction: when Agency takes 100% in an OVERRIDE, set non-agency to 0% to prevent 199% sums
                                     _candidate_ctype = resolve_commission_type(
@@ -3276,7 +3302,7 @@ def stage2_db_verify_dataset(
                                         "policyNumber": pol_number,
                                         "policyUuid": matched_db_rec.get("policy_uuid"),
                                         "writingAgentName": resolve_writing_agent_for_payload(
-                                            merged_splits,
+                                            file_commission_split,
                                             _wa_db_rec,
                                             pol_number=pol_number,
                                             pol_uuid=str(matched_db_rec.get("policy_uuid") or found_pol_uuid or ""),

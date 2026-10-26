@@ -519,6 +519,22 @@ class TestSubAgentCommissionFixes(unittest.TestCase):
         roles = sorted(classify_contract_role(c) for c in out["Contract"])
         self.assertEqual(roles, ["agency", "agency", "agent", "agent", "sales_leader", "sales_leader"])
 
+    def test_two_agents_with_same_role_are_both_kept(self):
+        """StreetZA and StreetZC are both agents. Sequence 2 must not be dropped."""
+        df = pd.DataFrame([
+            {"Policy No": "8502767093", "Product": "BCBS U65 AZ", "From Month": 1, "To Month": 12, "Contract": "StreetZC", "Sequence": 1, "Agent ID": "'12047257", "Agent Name": "EUGENE  ZANGARI", "Amount": "$17.00"},
+            {"Policy No": "8502767093", "Product": "BCBS U65 AZ", "From Month": 13, "To Month": 0, "Contract": "StreetZC", "Sequence": 1, "Agent ID": "'12047257", "Agent Name": "EUGENE  ZANGARI", "Amount": "$17.00"},
+            {"Policy No": "8502767093", "Product": "BCBS U65 AZ", "From Month": 1, "To Month": 12, "Contract": "StreetZA", "Sequence": 2, "Agent ID": "'7750822", "Agent Name": "ALESSANDRO  ZANGARI", "Amount": "$19.00"},
+            {"Policy No": "8502767093", "Product": "BCBS U65 AZ", "From Month": 13, "To Month": 0, "Contract": "StreetZA", "Sequence": 2, "Agent ID": "'7750822", "Agent Name": "ALESSANDRO  ZANGARI", "Amount": "$19.00"},
+            {"Policy No": "8502767093", "Product": "BCBS U65 AZ", "From Month": 1, "To Month": 12, "Contract": "Agency", "Sequence": 3, "Agent ID": "'20411454", "Agent Name": "MAIN LINE  BENEFITS", "Amount": "$20.00"},
+            {"Policy No": "8502767093", "Product": "BCBS U65 AZ", "From Month": 13, "To Month": 0, "Contract": "Agency", "Sequence": 3, "Agent ID": "'20411454", "Agent Name": "MAIN LINE  BENEFITS", "Amount": "$20.00"},
+        ])
+        out, summary = normalize_year_bands(df)
+        self.assertEqual(summary["rows_out"], 6)
+        names = set(out["Agent Name"])
+        self.assertIn("ALESSANDRO  ZANGARI", names)
+        self.assertIn("EUGENE  ZANGARI", names)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
