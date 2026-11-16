@@ -791,7 +791,7 @@ class ReadOnlyDatabaseManager:
             self.conn = None
 
     def fetch_all_users_and_contacts(self, agency_id: int) -> Dict[str, str]:
-        """Maps (agent_code / agent_name) -> user_uuid and populates user_display_by_uuid."""
+        """Map code/name -> user_uuid; contact names count only when relationship_id joins users.uuid."""
         if not self.conn:
             return {}
         user_map: Dict[str, str] = {}
@@ -817,14 +817,17 @@ class ReadOnlyDatabaseManager:
                             user_map[clean_c] = u_uuid
                             self.user_display_by_uuid[u_uuid.lower()] = {"name": "", "code": code}
 
-                # 2. Contacts table
+                # 2. Contacts name -> relationship_id only when join to users.uuid succeeds
                 cur.execute(
                     """
-                    SELECT relationship_id, first_name, last_name 
-                    FROM contacts 
-                    WHERE agency_id = %s AND relationship_id IS NOT NULL;
+                    SELECT c.relationship_id, c.first_name, c.last_name
+                    FROM contacts c
+                    INNER JOIN users u ON u.uuid = c.relationship_id
+                    WHERE c.agency_id = %s
+                      AND c.relationship_id IS NOT NULL
+                      AND (u.tenant_id = %s OR u.agency_id = %s);
                 """,
-                    (agency_id,),
+                    (agency_id, agency_id, agency_id),
                 )
                 for r in cur.fetchall():
                     rel_id = str(r.get("relationship_id") or "").strip()
