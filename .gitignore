@@ -25,6 +25,7 @@ env/
 
 # Pipeline / run outputs
 pipeline_output/
+ui_uploads/
 logs/
 *.log
 
