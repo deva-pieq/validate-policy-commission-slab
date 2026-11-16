@@ -42,7 +42,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Dependencies: `pandas`, `numpy`, `openpyxl`, `xlrd`, `psycopg2-binary`, `python-dotenv`, `tabulate`.
+Dependencies: `pandas`, `numpy`, `openpyxl`, `xlrd`, `psycopg2-binary`, `python-dotenv`, `tabulate`, `streamlit` (UI).
 
 ---
 
@@ -128,9 +128,9 @@ Upload sheet(s)
 ┌─────────────────────────────────────┐
 │ Delete gate (if mismatches/missing) │
 │  1. Write delete_commission_*.sql   │
-│  2. Senior eng runs DELETE manually │
-│  3. Confirm remaining = 0           │
-│  4. AUTO-POST recreate (no PUT)     │
+│  2. Ask: exclude mismatches?        │
+│  3. If include: DELETE remaining=0  │
+│  4. AUTO-POST selected (no PUT)     │
 └─────────────────────────────────────┘
 ```
 
@@ -141,6 +141,26 @@ pipeline_output/commission_validation_db/vYYYYMMDD_HHMMSS/
   input/     # archived copies of upload files
   output/    # reports, SQL, summaries
 ```
+
+---
+
+## UI (recommended)
+
+Local Streamlit app wrapping the DB validator and post-import APL validator — upload a file, stream logs, download reports, and confirm POST recreate without typing CLI flags.
+
+```bash
+pip install -r requirements.txt
+streamlit run ui/app.py
+```
+
+**UI flow**
+
+1. **Tab 1 — DB validation + POST gate:** upload (or path) → Run validation → download reports / `delete_commission_agency5.sql`.
+2. Share delete SQL with senior eng if you need mismatches recreated (UI never runs DELETE).
+3. In the same tab, choose **POST missing only** or **POST missing + mismatches** (requires DELETE remaining=0 checkbox) → Confirm POST recreate.
+4. **Tab 2 — Post-import APL validation:** run after updates are done; download the 6-tab workbook + annotated APL.
+
+Secrets stay in `.env` (DB / SSO). Uploaded files are stored under `ui_uploads/` (gitignored).
 
 ---
 
@@ -164,6 +184,9 @@ python validate_policy_commission_db.py --file Files --dry-run
 
 # After DELETE is already done — skip gate and POST recreate
 python validate_policy_commission_db.py --file Files -y --force-post-mismatches --skip-delete-gate
+
+# POST missing-in-DB only (skip mismatches; no DELETE required)
+python validate_policy_commission_db.py --file Files -y --post-missing-only --skip-delete-gate
 ```
 
 #### Flags — `validate_policy_commission_db.py`
@@ -183,15 +206,17 @@ python validate_policy_commission_db.py --file Files -y --force-post-mismatches 
 | `--tolerance` | `0.02` | Commission value match tolerance (±%) |
 | `-y` / `--yes` | off | Helper flag; delete gate still prompts `y/n`, then POST auto-runs |
 | `--skip-normalize` | off | Skip year-band From–To normalize and override 3-row expansion |
-| `--skip-delete-gate` | off | Skip delete SQL + confirm (pair with `--force-post-mismatches`) |
+| `--skip-delete-gate` | off | Skip delete SQL + confirm (pair with `--force-post-mismatches` or `--post-missing-only`) |
 | `--force-post-mismatches` | off | Skip confirm and AUTO-POST all missing/mismatch rules |
+| `--post-missing-only` | off | Exclude mismatches from AUTO-POST; only POST missing-in-DB rules |
 
 **Delete → POST flow**
 
 1. Validator writes `delete_commission_agency5.sql` (also under `docs/`). The `DELETE` lists mismatched `policy_commission.uuid` values only. A policy whose slabs all match is omitted. On a mixed policy, only the mismatched slab is deleted.
 2. Share SQL with a senior engineer; this repo **never** runs `DELETE`.
-3. After those mismatch rows are deleted and the remaining count is `0`, answer `y` — or re-run with `--force-post-mismatches --skip-delete-gate`.
-4. Script POSTs the missing and mismatched rules (no PUT). Matched slabs are not posted.
+3. When mismatches exist, the script asks whether to **exclude mismatch rules from this POST** (`y` = missing only, safe without DELETE; `n` = include mismatches after DELETE remaining `0`). Or pass `--post-missing-only`.
+4. To POST mismatches: after DELETE remaining is `0`, answer `y` — or re-run with `--force-post-mismatches --skip-delete-gate`.
+5. Script POSTs the selected rules (no PUT). Matched slabs are not posted.
 
 `generate_delete_commission_sql.py` no longer builds a delete from every policy number on the sheet. Run the validator to produce the SQL.
 
@@ -264,7 +289,11 @@ For a first-time bulk import of a clean sheet (no DB compare), use `import_polic
 
 ```
 .
+├── ui/
+│   ├── app.py                         # Streamlit UI (streamlit run ui/app.py)
+│   └── runner.py                      # Subprocess helpers for validators
 ├── validate_policy_commission_db.py   # Main validator + DB verify + POST gate
+├── validate_apl_vs_db_after_import.py # Post-import APL vs DB check
 ├── generate_delete_commission_sql.py  # Mismatch-uuid DELETE SQL writer
 ├── import_policy_commission.py        # API upload / create importer
 ├── requirements.txt
@@ -273,6 +302,7 @@ For a first-time bulk import of a clean sheet (no DB compare), use `import_polic
 ├── Truth+Sheets/                      # Rate sheet, norm map, agent roster
 ├── docs/                              # Shared delete SQL artifacts
 ├── logs/                              # Run logs
+├── ui_uploads/                        # UI uploads (gitignored)
 └── pipeline_output/                   # Versioned run outputs
 ```
 
