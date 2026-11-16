@@ -21,6 +21,7 @@ Stage 2 (Database Verification for agency_id = 5):
   - EXPORTS PHASE 2 REPORTS:
       * db_matched_commission_<timestamp>.xlsx
       * db_unmatched_commission_<timestamp>.xlsx
+      * updated_policies_<timestamp>.csv / .txt (unique policies successfully POST-recreated)
 
 Usage:
   python validate_policy_commission_db.py --file /path/to/commission_upload.csv
@@ -1953,7 +1954,7 @@ class DatabaseManager:
 
     @functools.lru_cache(maxsize=8192)
     def get_user_uuid(self, agency_id: int, user_code: str = None, user_name: str = None) -> Optional[str]:
-        """Queries users and contacts tables to find user UUID (relationship_id for contacts) by user_code (agent_id) or user_name."""
+        """Find user UUID by code (users) or name (contacts joined to users on relationship_id = uuid)."""
         if not self.conn:
             return None
         try:
@@ -1970,10 +1971,24 @@ class DatabaseManager:
                         return str(row["uuid"])
                 if user_name:
                     norm_name = " ".join(clean_name_ignoring_id(user_name).lower().split())
-                    # Check contacts table by full name, first name, or last name
+                    # Contacts name match is valid only when relationship_id joins users.uuid
+                    contact_name_sql = """
+                        SELECT c.relationship_id
+                        FROM contacts c
+                        INNER JOIN users u ON u.uuid = c.relationship_id
+                        WHERE c.agency_id = %s
+                          AND c.relationship_id IS NOT NULL
+                          AND (u.tenant_id = %s OR u.agency_id = %s)
+                          AND (
+                              lower(concat(c.first_name, ' ', c.last_name)) = %s
+                              OR lower(c.first_name) = %s
+                              OR lower(c.last_name) = %s
+                          )
+                        LIMIT 1;
+                    """
                     cur.execute(
-                        "SELECT relationship_id FROM contacts WHERE agency_id = %s AND (lower(concat(first_name, ' ', last_name)) = %s OR lower(first_name) = %s OR lower(last_name) = %s) AND relationship_id IS NOT NULL LIMIT 1;",
-                        (agency_id, norm_name, norm_name, norm_name)
+                        contact_name_sql,
+                        (agency_id, agency_id, agency_id, norm_name, norm_name, norm_name),
                     )
                     row = cur.fetchone()
                     if row and row.get("relationship_id"):
@@ -1982,8 +1997,17 @@ class DatabaseManager:
                     if norm_name.startswith("greg "):
                         alt_name = "gregory " + norm_name[5:]
                         cur.execute(
-                            "SELECT relationship_id FROM contacts WHERE agency_id = %s AND lower(concat(first_name, ' ', last_name)) = %s AND relationship_id IS NOT NULL LIMIT 1;",
-                            (agency_id, alt_name)
+                            """
+                            SELECT c.relationship_id
+                            FROM contacts c
+                            INNER JOIN users u ON u.uuid = c.relationship_id
+                            WHERE c.agency_id = %s
+                              AND c.relationship_id IS NOT NULL
+                              AND (u.tenant_id = %s OR u.agency_id = %s)
+                              AND lower(concat(c.first_name, ' ', c.last_name)) = %s
+                            LIMIT 1;
+                            """,
+                            (agency_id, agency_id, agency_id, alt_name),
                         )
                         row = cur.fetchone()
                         if row and row.get("relationship_id"):
@@ -1993,7 +2017,7 @@ class DatabaseManager:
         return None
 
     def fetch_all_users_map(self, agency_id: int) -> Dict[str, str]:
-        """Fetches a map of (clean_user_code or clean_user_name) -> user_uuid for the agency from users and contacts tables."""
+        """Map code/name -> user_uuid from users, plus contacts names that join users (relationship_id = uuid)."""
         if not self.conn:
             return {}
         user_map = {}
@@ -2018,13 +2042,16 @@ class DatabaseManager:
                         user_map[clean_c] = u_uuid
                         self.user_display_by_uuid[u_uuid.lower()] = {"name": "", "code": raw_code}
 
-                # 2. Query contacts table for fallback mappings (concat first_name + last_name -> relationship_id)
+                # 2. Contacts name -> relationship_id only when join to users.uuid succeeds
                 try:
                     cur.execute("""
-                        SELECT relationship_id, first_name, last_name 
-                        FROM contacts 
-                        WHERE agency_id = %s AND relationship_id IS NOT NULL;
-                    """, (agency_id,))
+                        SELECT c.relationship_id, c.first_name, c.last_name
+                        FROM contacts c
+                        INNER JOIN users u ON u.uuid = c.relationship_id
+                        WHERE c.agency_id = %s
+                          AND c.relationship_id IS NOT NULL
+                          AND (u.tenant_id = %s OR u.agency_id = %s);
+                    """, (agency_id, agency_id, agency_id))
                     c_rows = cur.fetchall()
                     for r in c_rows:
                         rel_id = str(r.get("relationship_id", "")).strip()
@@ -3401,6 +3428,47 @@ def stage2_db_verify_dataset(
     )
 
 
+def write_updated_policies_list(
+    successful_policies: Set[str],
+    output_dir: str,
+    df_updated: Optional[pd.DataFrame] = None,
+    policy_col: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Write a unique list of policies successfully updated via POST recreate.
+
+    Creates:
+      - updated_policies_<timestamp>.csv  (Policy No [, Policy UUID])
+      - updated_policies_<timestamp>.txt  (one Policy No per line)
+    Returns (csv_path, txt_path).
+    """
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(output_dir, f"updated_policies_{ts}.csv")
+    txt_path = os.path.join(output_dir, f"updated_policies_{ts}.txt")
+
+    uuid_by_policy: Dict[str, str] = {}
+    if df_updated is not None and not df_updated.empty and policy_col and policy_col in df_updated.columns:
+        uuid_col = next(
+            (c for c in df_updated.columns if str(c).strip().lower() in (
+                "obtained_policy_uuid", "policy_uuid", "policy uuid", "policyuuid"
+            )),
+            None,
+        )
+        if uuid_col:
+            for _, row in df_updated.drop_duplicates(subset=[policy_col]).iterrows():
+                pol = str(row[policy_col]).strip()
+                uuid_val = str(row.get(uuid_col) or "").strip()
+                if pol and uuid_val and uuid_val.lower() not in ("nan", "none"):
+                    uuid_by_policy[pol] = uuid_val
+
+    sorted_pols = sorted({str(p).strip() for p in successful_policies if str(p).strip()})
+    rows = [{"Policy No": p, "Policy UUID": uuid_by_policy.get(p, "")} for p in sorted_pols]
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(sorted_pols) + ("\n" if sorted_pols else ""))
+    return csv_path, txt_path
+
+
 def write_writing_agent_update_sql(
     corrections: List[dict],
     agency_id: int,
@@ -3957,6 +4025,11 @@ def main():
         "--force-post-mismatches",
         action="store_true",
         help="Delete already done: skip confirm and AUTO-POST all missing/mismatch rules now",
+    )
+    parser.add_argument(
+        "--post-missing-only",
+        action="store_true",
+        help="Exclude mismatch rules from AUTO-POST; only POST missing-in-DB rules (no delete required)",
     )
 
     args = parser.parse_args()
@@ -4553,35 +4626,48 @@ def main():
     # ------------------------------------------------------------------
     # FLOW: delete SQL -> approve -> POST recreate (no PUT)
     #   1) Write DELETE for mismatched policy_commission.uuid values only
-    #   2) Wait for human: delete done / remaining=0
-    #   3) On y: auto-POST missing + mismatch create payloads (strip old rule_uuid)
+    #   2) Optionally exclude mismatches from POST (missing-only)
+    #   3) Wait for human: delete done / remaining=0 (when posting mismatches)
+    #   4) On y: auto-POST selected create payloads (strip old rule_uuid)
     # Matched slabs are not in the DELETE and are not posted.
     # ------------------------------------------------------------------
-    post_payloads = list(unique_missing_payloads or []) + list(unique_mismatch_payloads or [])
-    # Dedupe by (policyUuid, monthFrom, monthTo, commissionType)
-    deduped = []
-    seen_keys = set()
-    for p in post_payloads:
-        key = (
-            str(p.get("policyUuid") or ""),
-            str(p.get("monthFrom")),
-            str(p.get("monthTo")),
-            str(p.get("commissionType")),
-        )
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        deduped.append(p)
-    post_payloads = deduped
+    def _dedupe_post_payloads(payloads):
+        deduped = []
+        seen_keys = set()
+        for p in payloads:
+            key = (
+                str(p.get("policyUuid") or ""),
+                str(p.get("monthFrom")),
+                str(p.get("monthTo")),
+                str(p.get("commissionType")),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(p)
+        return deduped
 
-    if not post_payloads:
+    missing_only = bool(getattr(args, "post_missing_only", False))
+    # --force-post-mismatches means include mismatches; it wins over --post-missing-only
+    if args.force_post_mismatches:
+        missing_only = False
+
+    all_candidate_payloads = _dedupe_post_payloads(
+        list(unique_missing_payloads or []) + list(unique_mismatch_payloads or [])
+    )
+    post_payloads = all_candidate_payloads
+
+    if not all_candidate_payloads:
         print("\nℹ️ No missing/mismatch payloads to recreate via POST.")
-    elif args.skip_delete_gate and not args.force_post_mismatches:
+    elif args.skip_delete_gate and not args.force_post_mismatches and not missing_only:
         print("\n⏩ --skip-delete-gate set without --force-post-mismatches: skipping delete gate and POST recreate.")
-        print("   Use --force-post-mismatches to POST after delete is already done.")
+        print("   Use --force-post-mismatches to POST after delete is already done,")
+        print("   or --post-missing-only to POST missing rules without delete.")
     else:
-        delete_approved = bool(args.force_post_mismatches)
-        if not args.force_post_mismatches:
+        delete_approved = bool(args.force_post_mismatches) or (
+            bool(args.skip_delete_gate) and missing_only
+        )
+        if not args.force_post_mismatches and not (args.skip_delete_gate and missing_only):
             print("\n" + "=" * 80)
             print("FLOW STEP 1/2 — DELETE GATE (share SQL with senior eng)")
             print("=" * 80)
@@ -4594,7 +4680,7 @@ def main():
             invalid_mismatch_rows = [
                 p for p in (invalid_user_uuid_payloads or []) if str(p.get("rule_uuid") or "").strip()
             ]
-            print(f"Rules to create after the delete step: {len(post_payloads)}")
+            print(f"Rules available to create: {len(all_candidate_payloads)}")
             print(f"  - missing in DB (no delete): {len(unique_missing_payloads or [])}")
             print(f"  - mismatch rows to delete:   {len(mismatch_uuids)}")
             print("  - matched slabs are omitted from the DELETE and are not posted")
@@ -4626,34 +4712,77 @@ def main():
             except Exception as de:
                 print(f"⚠️ Could not write delete SQL: {de}")
 
-            if mismatch_uuids:
+            # Ask whether to drop mismatch rules from this POST (safe without DELETE)
+            if mismatch_uuids and not missing_only:
+                exclude_prompt = (
+                    "\nExclude mismatch rules from this POST?\n"
+                    "  y = POST missing-in-DB only (safe now; leave mismatches for later)\n"
+                    "  n = include mismatches (requires DELETE remaining=0 first)\n"
+                    "Type 'y' or 'n': "
+                )
+                exclude_ans = input(exclude_prompt).strip().lower()
+                missing_only = exclude_ans in ("y", "yes")
+
+            if missing_only:
+                post_payloads = _dedupe_post_payloads(list(unique_missing_payloads or []))
+                print(
+                    f"\n➡️ Mismatch POST eliminated for this run. "
+                    f"Will POST missing only: {len(post_payloads)} payload(s)."
+                )
+                if not post_payloads:
+                    print("ℹ️ No missing payloads left to POST after excluding mismatches.")
+                    delete_approved = False
+                else:
+                    confirm_prompt = (
+                        "\nFLOW STEP 2/2 — POST missing rules only (mismatches skipped).\n"
+                        "Type 'y' to AUTO-POST missing rules now (n to stop): "
+                    )
+                    confirm_del = input(confirm_prompt).strip().lower()
+                    delete_approved = confirm_del in ("y", "yes")
+            elif mismatch_uuids:
+                post_payloads = all_candidate_payloads
                 confirm_prompt = (
                     "\nFLOW STEP 2/2 — Mismatch rows deleted and remaining=0?\n"
                     "Type 'y' to AUTO-POST missing and mismatch rules now (n to stop): "
                 )
+                confirm_del = input(confirm_prompt).strip().lower()
+                delete_approved = confirm_del in ("y", "yes")
             else:
+                post_payloads = all_candidate_payloads
                 confirm_prompt = (
                     "\nFLOW STEP 2/2 — No mismatch rows to delete.\n"
                     "Type 'y' to AUTO-POST missing rules now (n to stop): "
                 )
-            confirm_del = input(confirm_prompt).strip().lower()
-            delete_approved = confirm_del in ("y", "yes")
+                confirm_del = input(confirm_prompt).strip().lower()
+                delete_approved = confirm_del in ("y", "yes")
+        elif missing_only:
+            post_payloads = _dedupe_post_payloads(list(unique_missing_payloads or []))
+            print(
+                f"\n➡️ --post-missing-only: POST missing only "
+                f"({len(post_payloads)} payload(s); mismatches excluded)."
+            )
 
-        if delete_approved:
+        if delete_approved and post_payloads:
+            scope = "missing only" if missing_only else "missing + mismatch"
             print("\n" + "=" * 80)
-            print(f"FLOW — AUTO-POST recreate: {len(post_payloads)} payload(s) (no PUT)")
+            print(f"FLOW — AUTO-POST recreate ({scope}): {len(post_payloads)} payload(s) (no PUT)")
             print("=" * 80)
             successful_policies = run_post_commission_payloads(
                 payloads=post_payloads,
                 output_dir=output_dir,
                 auto_confirm=True,
             )
+        elif delete_approved and not post_payloads:
+            print("\nℹ️ Nothing to POST.")
         else:
             print("Stopped before POST. After delete is done, re-run:")
             print("  python validate_policy_commission_db.py -y --force-post-mismatches --skip-delete-gate")
+            print("Or to POST missing only (no delete):")
+            print("  python validate_policy_commission_db.py -y --post-missing-only --skip-delete-gate")
 
     if successful_policies:
         pol_col_s2 = next((c for c in df_stage2_unmatched.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
+        df_updated = pd.DataFrame()
         if pol_col_s2:
             df_updated = df_stage2_unmatched[df_stage2_unmatched[pol_col_s2].astype(str).isin([str(p) for p in successful_policies])].copy()
             if not df_updated.empty:
@@ -4662,6 +4791,20 @@ def main():
                 out_path = os.path.join(output_dir, f"db_verification_auto_updated_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
                 df_updated.to_excel(out_path, index=False)
                 print(f"\n✅ Created Auto-Updated DB Match File with {len(df_updated)} rows: {out_path}")
+
+        try:
+            csv_path, txt_path = write_updated_policies_list(
+                successful_policies=successful_policies,
+                output_dir=output_dir,
+                df_updated=df_updated if not df_updated.empty else None,
+                policy_col=pol_col_s2,
+            )
+            print(
+                f"✅ Updated policies list ({len(successful_policies)} unique): "
+                f"{csv_path} | {txt_path}"
+            )
+        except Exception as upe:
+            print(f"⚠️ Could not write updated policies list: {upe}")
 
         # Fetch latest post-update DB commission snapshot directly from database
         print("\n" + "="*80)
