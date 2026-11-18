@@ -155,7 +155,7 @@ streamlit run ui/app.py
 
 **UI flow**
 
-1. **Tab 1 — DB validation + POST gate:** upload (or path) → Run validation → download reports / `delete_commission_agency5.sql`.
+1. **Tab 1 — DB validation + POST gate:** upload file → Run validation → download reports / `delete_commission_agency5.sql`.
 2. Share delete SQL with senior eng if you need mismatches recreated (UI never runs DELETE).
 3. In the same tab, choose **POST missing only** or **POST missing + mismatches** (requires DELETE remaining=0 checkbox) → Confirm POST recreate.
 4. **Tab 2 — Post-import APL validation:** run after updates are done; download the 6-tab workbook + annotated APL.
@@ -264,7 +264,7 @@ python import_policy_commission.py --api-base-url https://prod.api.pieq.ai -v
 | `file_validated_errors_*.xlsx` | 1 | Rows that failed file validation |
 | `db_commission_snapshot_*.xlsx` | 1.5 | Current DB commission rows for valid policies |
 | `db_matched_commission_*.xlsx` | 2 | File vs DB matches |
-| `db_unmatched_commission_*.xlsx` | 2 | Missing / mismatched rules |
+| `db_unmatched_commission_*.xlsx` | 2 | Missing / mismatched rules (audit cols + `Difference` / `Issue_Party` / `Affected_Person`, e.g. `0.5\|0.12`, `Agent \| Agency`, `Jason \| MLB`) |
 | `validation_summary_*.md` | 2 | Counts + mismatch detail |
 | `delete_commission_agency5.sql` | Gate | DELETE of mismatched commission uuids only |
 | `db_commission_snapshot_post_update_*.xlsx` | Post | Snapshot after successful POST recreate |
