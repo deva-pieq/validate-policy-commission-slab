@@ -10,6 +10,7 @@ Uses .env for DB/API secrets (never edited in the UI).
 
 from __future__ import annotations
 
+import html
 import os
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,58 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _inject_layout_css() -> None:
+    """Keep the main pane scrollable; Streamlit defaults often clip tall pages."""
+    st.markdown(
+        """
+<style>
+  /* Let the page / main pane scroll instead of clipping content */
+  html, body, #root, .stApp {
+    height: 100% !important;
+    overflow-y: auto !important;
+  }
+  [data-testid="stAppViewContainer"] {
+    overflow: auto !important;
+    height: 100% !important;
+  }
+  [data-testid="stAppViewContainer"] > .main,
+  section.main,
+  [data-testid="stMain"],
+  [data-testid="stMain"] > div {
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    height: auto !important;
+    max-height: none !important;
+  }
+  [data-testid="stMain"] {
+    height: 100% !important;
+  }
+  .block-container {
+    padding-top: 1.25rem !important;
+    padding-bottom: 4rem !important;
+    max-width: 1100px !important;
+    overflow: visible !important;
+  }
+  /* Scrollable run logs — keep the rest of the UI reachable without browser zoom */
+  pre.ui-log-scroll {
+    max-height: min(40vh, 420px) !important;
+    overflow: auto !important;
+    white-space: pre-wrap !important;
+    word-break: break-word !important;
+    font-size: 0.8rem !important;
+    line-height: 1.35 !important;
+    background: #0e1117 !important;
+    color: #fafafa !important;
+    padding: 0.75rem 1rem !important;
+    border-radius: 0.5rem !important;
+    margin: 0 !important;
+  }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _env_defaults() -> dict:
@@ -117,7 +170,8 @@ def _sidebar_common(env: dict) -> dict:
 
 
 def _render_log(placeholder, text: str):
-    placeholder.code(text[-80000:] if text else "(waiting for output…)", language="text")
+    body = html.escape(text[-80000:] if text else "(waiting for output…)")
+    placeholder.markdown(f'<pre class="ui-log-scroll">{body}</pre>', unsafe_allow_html=True)
 
 
 def tab_db_validation(shared: dict, env: dict):
@@ -131,11 +185,6 @@ def tab_db_validation(shared: dict, env: dict):
         "Commission upload (CSV / Excel)",
         type=["csv", "xlsx", "xls"],
         key="db_upload",
-    )
-    existing_path = st.text_input(
-        "Or path on disk (overrides upload if set)",
-        value=st.session_state.get("db_file_path") or env.get("UPLOAD_FILE_PATH") or "",
-        key="db_path_input",
     )
 
     with st.expander("Optional mapping files", expanded=False):
@@ -174,14 +223,11 @@ def tab_db_validation(shared: dict, env: dict):
         st.session_state.db_cancel = True
 
     if run_clicked:
-        # Resolve input file
-        file_path = (existing_path or "").strip() or None
-        if uploaded is not None and not (existing_path or "").strip():
+        if uploaded is None:
+            st.error("Upload a commission CSV or Excel file.")
+        else:
             saved = save_uploaded_file(uploaded)
             file_path = str(saved)
-        if not file_path or not os.path.exists(file_path):
-            st.error("Provide an uploaded file or a valid path on disk.")
-        else:
             st.session_state.db_file_path = file_path
             st.session_state.db_cancel = False
             st.session_state.db_running = True
@@ -357,12 +403,6 @@ def tab_apl_validation(shared: dict, env: dict):
         type=["csv", "xlsx", "xls"],
         key="apl_upload",
     )
-    default_path = st.session_state.get("db_file_path") or env.get("UPLOAD_FILE_PATH") or ""
-    existing_path = st.text_input(
-        "Or path on disk (defaults to Tab 1 file when available)",
-        value=st.session_state.get("apl_file_path") or default_path,
-        key="apl_path_input",
-    )
     exec_report = st.text_input("Optional execution report path", value="", key="apl_exec")
 
     c1, c2 = st.columns(2)
@@ -381,13 +421,11 @@ def tab_apl_validation(shared: dict, env: dict):
         st.session_state.apl_cancel = True
 
     if run_clicked:
-        file_path = (existing_path or "").strip() or None
-        if uploaded is not None and not (existing_path or "").strip():
+        if uploaded is None:
+            st.error("Upload an APL / commission CSV or Excel file.")
+        else:
             saved = save_uploaded_file(uploaded, run_id=f"apl_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
             file_path = str(saved)
-        if not file_path or not os.path.exists(file_path):
-            st.error("Provide an uploaded file or a valid path on disk.")
-        else:
             st.session_state.apl_file_path = file_path
             st.session_state.apl_cancel = False
             st.session_state.apl_running = True
@@ -442,6 +480,7 @@ def tab_apl_validation(shared: dict, env: dict):
 
 def main():
     _init_state()
+    _inject_layout_css()
     env = _env_defaults()
     st.title("Commission Validators")
     st.caption(
