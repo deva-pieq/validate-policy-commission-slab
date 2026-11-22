@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -75,17 +76,25 @@ def _inject_layout_css() -> None:
   }
   /* Scrollable run logs — keep the rest of the UI reachable without browser zoom */
   pre.ui-log-scroll {
-    max-height: min(40vh, 420px) !important;
+    max-height: min(55vh, 560px) !important;
     overflow: auto !important;
+    /* pre: honour \n line breaks; word-break so long paths wrap instead of scroll */
     white-space: pre-wrap !important;
-    word-break: break-word !important;
-    font-size: 0.8rem !important;
-    line-height: 1.35 !important;
-    background: #0e1117 !important;
-    color: #fafafa !important;
-    padding: 0.75rem 1rem !important;
+    word-break: break-all !important;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace !important;
+    font-size: 0.78rem !important;
+    line-height: 1.5 !important;
+    background: #0d1117 !important;
+    color: #e6edf3 !important;
+    padding: 0.9rem 1.1rem !important;
     border-radius: 0.5rem !important;
+    border: 1px solid #30363d !important;
     margin: 0 !important;
+    tab-size: 4 !important;
+  }
+  /* Section divider lines (====, ----) render lighter so they don't dominate */
+  pre.ui-log-scroll {
+    letter-spacing: 0.01em !important;
   }
 </style>
         """,
@@ -162,7 +171,7 @@ def _sidebar_common(env: dict) -> dict:
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "**Safety**\n\n"
-        "- DELETE SQL is download-only — never executed by this UI.\n"
+        "- Mismatch delete uses API `DELETE /api/v1/policy/commission/{uuid}` after confirm.\n"
         "- POST recreate only runs after you confirm in Tab 1.\n"
         "- Use Tab 2 after updates are complete."
     )
@@ -171,7 +180,31 @@ def _sidebar_common(env: dict) -> dict:
 
 def _render_log(placeholder, text: str):
     body = html.escape(text[-80000:] if text else "(waiting for output…)")
-    placeholder.markdown(f'<pre class="ui-log-scroll">{body}</pre>', unsafe_allow_html=True)
+    placeholder.markdown(
+        f'<pre class="ui-log-scroll" id="ui-log-scroll-box">{body}</pre>'
+        # Auto-scroll to bottom so the latest line is always visible
+        '<script>'
+        'var el=document.getElementById("ui-log-scroll-box");'
+        'if(el){el.scrollTop=el.scrollHeight;}'
+        '</script>',
+        unsafe_allow_html=True,
+    )
+
+
+def _make_throttled_on_line(buf: List[str], state_key: str, log_box, every_n: int = 25, every_s: float = 0.75):
+    """Append lines always; refresh the UI log only periodically (keeps UI responsive)."""
+    state = {"n": 0, "last": 0.0}
+
+    def on_line(line: str):
+        buf.append(line)
+        st.session_state[state_key] = "\n".join(buf)
+        state["n"] += 1
+        now = time.time()
+        if state["n"] == 1 or state["n"] % every_n == 0 or (now - state["last"]) >= every_s:
+            state["last"] = now
+            _render_log(log_box, st.session_state[state_key])
+
+    return on_line
 
 
 def tab_db_validation(shared: dict, env: dict):
@@ -258,11 +291,7 @@ def tab_db_validation(shared: dict, env: dict):
                 "Running validation (writes delete SQL; answers n to skip POST)…"
             )
             buf: List[str] = []
-
-            def on_line(line: str):
-                buf.append(line)
-                st.session_state.db_log = "\n".join(buf)
-                _render_log(log_box, st.session_state.db_log)
+            on_line = _make_throttled_on_line(buf, "db_log", log_box)
 
             result = run_command(
                 argv,
@@ -270,6 +299,7 @@ def tab_db_validation(shared: dict, env: dict):
                 cancel_check=lambda: bool(st.session_state.get("db_cancel")),
                 stdin_text=stdin_decline_post(),
             )
+            _render_log(log_box, st.session_state.get("db_log") or "\n".join(buf))
             st.session_state.db_result = result
             st.session_state.db_output_dir = result.output_dir
             st.session_state.db_running = False
@@ -294,48 +324,55 @@ def tab_db_validation(shared: dict, env: dict):
         hints = parse_gate_hints(result.log_text or "")
         # If validate-only skipped the gate printout, still show POST panel
         st.markdown("---")
-        st.markdown("### Update gate (optional POST recreate)")
-        st.warning(
-            "This UI never runs DELETE. Download `delete_commission_agency5.sql`, "
-            "have senior eng run it, confirm remaining=0, then choose a POST option."
+        st.markdown("### Update gate (optional API DELETE + POST recreate)")
+        st.info(
+            "Mismatch delete uses `DELETE /api/v1/policy/commission/{uuid}`. "
+            "`delete_commission_agency5.sql` is still generated with the UUID list."
         )
-        if hints.get("missing") is not None or hints.get("mismatch_delete") is not None:
+        delete_count = hints.get("mismatch_delete")
+        if hints.get("missing") is not None or delete_count is not None:
             m1, m2, m3 = st.columns(3)
             m1.metric("Missing (no delete)", hints.get("missing") if hints.get("missing") is not None else "—")
             m2.metric(
-                "Mismatch to delete",
-                hints.get("mismatch_delete") if hints.get("mismatch_delete") is not None else "—",
+                "Lines that will be deleted",
+                delete_count if delete_count is not None else "—",
             )
             m3.metric(
                 "Left in place (invalid)",
                 hints.get("invalid_left_in_place") if hints.get("invalid_left_in_place") is not None else "—",
             )
         else:
-            st.caption("Gate counts not found in log — check delete SQL / unmatched report below.")
+            st.caption("Gate counts not found in log — check unmatched report / delete SQL below.")
 
         post_mode = st.radio(
-            "POST action",
+            "Update action",
             options=["skip", "missing_only", "with_mismatches"],
             format_func=lambda x: {
-                "skip": "Skip POST",
-                "missing_only": "POST missing-in-DB only (safe without DELETE)",
-                "with_mismatches": "POST missing + mismatches (requires DELETE remaining=0)",
+                "skip": "Skip update",
+                "missing_only": "POST missing-in-DB only (no API delete)",
+                "with_mismatches": (
+                    f"API-DELETE {delete_count} line(s), then POST missing + mismatches"
+                    if delete_count is not None
+                    else "API-DELETE mismatches, then POST missing + mismatches"
+                ),
             }[x],
             key="post_mode",
         )
 
         confirm_delete = False
         if post_mode == "with_mismatches":
-            confirm_delete = st.checkbox(
-                "I confirm mismatch rows were deleted and remaining = 0",
-                key="confirm_delete_zero",
+            confirm_label = (
+                f"I confirm API DELETE of {delete_count} line(s), then POST recreate"
+                if delete_count is not None
+                else "I confirm API DELETE of mismatch rules, then POST recreate"
             )
+            confirm_delete = st.checkbox(confirm_label, key="confirm_delete_zero")
 
         post_log_box = st.empty()
         post_status = st.empty()
-        if st.button("Confirm POST recreate", type="primary", disabled=post_mode == "skip", key="post_go"):
+        if st.button("Confirm update", type="primary", disabled=post_mode == "skip", key="post_go"):
             if post_mode == "with_mismatches" and not confirm_delete:
-                st.error("Check the DELETE remaining=0 confirmation first.")
+                st.error("Confirm API DELETE + POST before continuing.")
             elif not st.session_state.db_file_path:
                 st.error("No input file from the validation run.")
             else:
@@ -359,17 +396,14 @@ def tab_db_validation(shared: dict, env: dict):
                 )
                 post_status.info(f"Running POST recreate ({post_mode})…")
                 buf: List[str] = []
-
-                def on_line(line: str):
-                    buf.append(line)
-                    st.session_state.post_log = "\n".join(buf)
-                    _render_log(post_log_box, st.session_state.post_log)
+                on_line = _make_throttled_on_line(buf, "post_log", post_log_box)
 
                 post_result = run_command(
                     argv,
                     on_line=on_line,
                     cancel_check=lambda: bool(st.session_state.get("db_cancel")),
                 )
+                _render_log(post_log_box, st.session_state.get("post_log") or "\n".join(buf))
                 st.session_state.post_result = post_result
                 if post_result.output_dir:
                     st.session_state.db_output_dir = post_result.output_dir
@@ -442,17 +476,14 @@ def tab_apl_validation(shared: dict, env: dict):
             )
             status_box.info("Running post-import APL validation…")
             buf: List[str] = []
-
-            def on_line(line: str):
-                buf.append(line)
-                st.session_state.apl_log = "\n".join(buf)
-                _render_log(log_box, st.session_state.apl_log)
+            on_line = _make_throttled_on_line(buf, "apl_log", log_box)
 
             result = run_command(
                 argv,
                 on_line=on_line,
                 cancel_check=lambda: bool(st.session_state.get("apl_cancel")),
             )
+            _render_log(log_box, st.session_state.get("apl_log") or "\n".join(buf))
             st.session_state.apl_result = result
             st.session_state.apl_output_dir = result.output_dir
             st.session_state.apl_running = False
