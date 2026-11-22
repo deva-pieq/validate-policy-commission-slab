@@ -765,6 +765,22 @@ def confirm_payload(logger, idx: int, total: int, payload: dict, auto_confirm: b
     pol_num = payload.get("policyNumber", "Unknown")
     rule_name = payload.get("ruleName", "N/A")
     splits = payload.get("commissionSplit", [])
+    split_issues = commission_payload_issues(payload)
+
+    # Auto-confirm path (UI / -y): keep logs tiny so Streamlit pipes cannot fill up.
+    if auto_confirm:
+        if split_issues:
+            logger.error(f"Blocked {action_name} for Policy #{pol_num}: " + "; ".join(split_issues))
+            print(f"[{idx}/{total}] {action_name} blocked for #{pol_num}: " + "; ".join(split_issues))
+            return "skip"
+        if idx == 1 or idx == total or idx % 25 == 0:
+            print(
+                f"[{idx}/{total}] Auto-{action_name} #{pol_num} "
+                f"months {payload.get('monthFrom')}->{payload.get('monthTo')} "
+                f"type={payload.get('commissionType')} splits={len(splits)}"
+            )
+        logger.info(f"Auto-confirming payload for Policy #{pol_num} (--yes flag active).")
+        return "yes"
 
     print("\n" + "=" * 78)
     print(f"  [PAYLOAD CONFIRMATION {idx}/{total}] Policy #{pol_num}")
@@ -784,7 +800,6 @@ def confirm_payload(logger, idx: int, total: int, payload: dict, auto_confirm: b
         level_str = f" [{s['level']}]" if s.get("level") else ""
         print(f"   Order {s.get('order')} | Role: {s.get('role', 'nan'):<12}{level_str:<10} | Entity: {s.get('entity'):<7} | Rate: {s.get('commission_value')}% | User: {user_info}")
 
-    split_issues = commission_payload_issues(payload)
     print("\n Split validation:")
     if split_issues:
         print("   FAIL")
@@ -808,10 +823,6 @@ def confirm_payload(logger, idx: int, total: int, payload: dict, auto_confirm: b
         logger.error(f"Blocked {action_name} for Policy #{pol_num}: " + "; ".join(split_issues))
         print(f"\n{action_name} blocked. Fix the split validation failures above before this policy can be imported.")
         return "skip"
-
-    if auto_confirm:
-        logger.info(f"Auto-confirming payload for Policy #{pol_num} (--yes flag active).")
-        return "yes"
 
     try:
         while True:
