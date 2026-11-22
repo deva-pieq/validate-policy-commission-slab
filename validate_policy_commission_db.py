@@ -1935,16 +1935,25 @@ class DatabaseManager:
         return None
 
     def get_policy_commission(self, agency_id: int, policy_uuid: str) -> List[dict]:
-        """Queries policy_commission table: SELECT * FROM policy_commission WHERE agency_id = %s AND policy_uuid::text = %s"""
+        """Fetch policy_commission rows with created/updated audit + contact display names."""
         if not self.conn:
             return []
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                 query = """
-                    SELECT * 
-                    FROM policy_commission 
-                    WHERE agency_id = %s 
-                      AND policy_uuid::text = %s;
+                    SELECT
+                        pc.*,
+                        TRIM(CONCAT(COALESCE(c_created.first_name, ''), ' ', COALESCE(c_created.last_name, ''))) AS created_by_name,
+                        TRIM(CONCAT(COALESCE(c_updated.first_name, ''), ' ', COALESCE(c_updated.last_name, ''))) AS updated_by_name
+                    FROM policy_commission pc
+                    LEFT JOIN contacts c_created
+                        ON c_created.relationship_id = pc.created_by
+                       AND c_created.agency_id = pc.agency_id
+                    LEFT JOIN contacts c_updated
+                        ON c_updated.relationship_id = pc.updated_by
+                       AND c_updated.agency_id = pc.agency_id
+                    WHERE pc.agency_id = %s
+                      AND pc.policy_uuid::text = %s;
                 """
                 cur.execute(query, (agency_id, str(policy_uuid)))
                 return [dict(r) for r in cur.fetchall()]
@@ -2138,9 +2147,9 @@ class DatabaseManager:
                 policy_rows = cur.fetchall()
 
                 # Query 2: Fetch policy_commission records for the matching policies
-                if clean_pols:
-                    query_commissions = """
-                        SELECT 
+                # Include audit timestamps + creator/updater display names via contacts.relationship_id
+                _comm_select = """
+                        SELECT
                             pc.uuid AS commission_uuid,
                             pc.policy_uuid,
                             pc.rule_name,
@@ -2152,8 +2161,23 @@ class DatabaseManager:
                             pc.payout_method,
                             pc.fee_amount,
                             pc.premium_amount,
-                            pc.commission_split
+                            pc.commission_split,
+                            pc.created_at,
+                            pc.updated_at,
+                            pc.created_by,
+                            pc.updated_by,
+                            TRIM(CONCAT(COALESCE(c_created.first_name, ''), ' ', COALESCE(c_created.last_name, ''))) AS created_by_name,
+                            TRIM(CONCAT(COALESCE(c_updated.first_name, ''), ' ', COALESCE(c_updated.last_name, ''))) AS updated_by_name
                         FROM policy_commission pc
+                        LEFT JOIN contacts c_created
+                            ON c_created.relationship_id = pc.created_by
+                           AND c_created.agency_id = pc.agency_id
+                        LEFT JOIN contacts c_updated
+                            ON c_updated.relationship_id = pc.updated_by
+                           AND c_updated.agency_id = pc.agency_id
+                """
+                if clean_pols:
+                    query_commissions = _comm_select + """
                         WHERE pc.agency_id = %s
                           AND pc.policy_uuid IN (
                               SELECT uuid FROM policies WHERE agency_id = %s AND number = ANY(%s)
@@ -2161,21 +2185,7 @@ class DatabaseManager:
                     """
                     cur.execute(query_commissions, (agency_id, agency_id, clean_pols))
                 else:
-                    query_commissions = """
-                        SELECT 
-                            pc.uuid AS commission_uuid,
-                            pc.policy_uuid,
-                            pc.rule_name,
-                            pc.version,
-                            pc.commission_type,
-                            pc.payment_frequency,
-                            pc.month_from,
-                            pc.month_to,
-                            pc.payout_method,
-                            pc.fee_amount,
-                            pc.premium_amount,
-                            pc.commission_split
-                        FROM policy_commission pc
+                    query_commissions = _comm_select + """
                         WHERE pc.agency_id = %s;
                     """
                     cur.execute(query_commissions, (agency_id,))
@@ -2210,6 +2220,12 @@ class DatabaseManager:
                             "fee_amount": None,
                             "premium_amount": None,
                             "commission_split": None,
+                            "created_at": None,
+                            "updated_at": None,
+                            "created_by": None,
+                            "updated_by": None,
+                            "created_by_name": None,
+                            "updated_by_name": None,
                         })
                         recs = [rec]
                     else:
@@ -2270,7 +2286,7 @@ class DatabaseManager:
                 where_clause = " OR ".join(query_conditions)
                 
                 query = f"""
-                    SELECT 
+                    SELECT
                         p.uuid AS product_uuid,
                         p.name AS product_name,
                         pol.uuid AS policy_uuid,
@@ -2287,10 +2303,22 @@ class DatabaseManager:
                         pc.payout_method,
                         pc.fee_amount,
                         pc.premium_amount,
-                        pc.commission_split
+                        pc.commission_split,
+                        pc.created_at,
+                        pc.updated_at,
+                        pc.created_by,
+                        pc.updated_by,
+                        TRIM(CONCAT(COALESCE(c_created.first_name, ''), ' ', COALESCE(c_created.last_name, ''))) AS created_by_name,
+                        TRIM(CONCAT(COALESCE(c_updated.first_name, ''), ' ', COALESCE(c_updated.last_name, ''))) AS updated_by_name
                     FROM products p
                     JOIN policies pol ON (pol.agency_id = p.agency_id AND pol.product_id::text = p.uuid::text)
                     LEFT JOIN policy_commission pc ON (pc.agency_id = p.agency_id AND pc.policy_uuid::text = pol.uuid::text)
+                    LEFT JOIN contacts c_created
+                        ON c_created.relationship_id = pc.created_by
+                       AND c_created.agency_id = pc.agency_id
+                    LEFT JOIN contacts c_updated
+                        ON c_updated.relationship_id = pc.updated_by
+                       AND c_updated.agency_id = pc.agency_id
                     WHERE p.agency_id = %s
                       AND pol.agency_id = %s
                       AND ({where_clause});
@@ -2451,6 +2479,179 @@ def build_file_commission_split(group: pd.DataFrame, seq_col, agent_col, agent_n
 
     return commission_split
 
+
+def format_commission_audit_fields(db_rec: Optional[dict]) -> Tuple[str, str, str, str]:
+    """
+    Extract created_at / updated_at / created_by / updated_by for Stage 2 reports.
+    created_by / updated_by prefer contacts first+last name (created_by_name / updated_by_name);
+    fall back to raw UUID when the contact join had no name.
+    """
+    if not db_rec:
+        return "", "", "", ""
+
+    def _ts(val) -> str:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return ""
+        return str(val).strip()
+
+    def _name(name_key: str, uuid_key: str) -> str:
+        name = " ".join(str(db_rec.get(name_key) or "").split())
+        if name:
+            return name
+        return str(db_rec.get(uuid_key) or "").strip()
+
+    return (
+        _ts(db_rec.get("created_at")),
+        _ts(db_rec.get("updated_at")),
+        _name("created_by_name", "created_by"),
+        _name("updated_by_name", "updated_by"),
+    )
+
+
+_ISSUE_PARTY_LABELS = {
+    "agency": "Agency",
+    "sales_leader": "Sales Leader",
+    "agent": "Agent",
+    "sub_agent": "Sub Agent",
+}
+
+
+def _format_difference_value(value: float) -> str:
+    """Compact difference display: 0.5, 0.12, 67.57 (no trailing zeros)."""
+    try:
+        num = abs(float(value))
+    except (TypeError, ValueError):
+        return ""
+    if abs(num - round(num)) < 1e-9:
+        return str(int(round(num)))
+    text = f"{num:.4f}".rstrip("0").rstrip(".")
+    return text
+
+
+def _issue_person_display(name: str = "", code: str = "", role_key: str = "", item: Optional[dict] = None) -> str:
+    """Agency/MLB → MLB; people → first name (e.g. Jason)."""
+    if role_key == "agency" or _is_mlb_or_agency_person(name, code, item):
+        return "MLB"
+    cleaned = " ".join(str(name or "").split())
+    if cleaned:
+        return cleaned.split()[0].title()
+    code_s = str(code or "").strip()
+    return code_s
+
+
+def build_unmatched_issue_summary(
+    file_splits: Optional[list],
+    db_splits: Optional[list],
+    tolerance: float = 0.02,
+    fee_file: Optional[float] = None,
+    fee_db: Optional[float] = None,
+) -> Tuple[str, str, str]:
+    """
+    Build unmatched report helpers:
+      Difference      → 0.5|0.12
+      Issue_Party     → Agent | Agency
+      Affected_Person → Jason | MLB
+    """
+    file_list = file_splits if isinstance(file_splits, list) else []
+    db_list = db_splits if isinstance(db_splits, list) else []
+
+    def _role_key_of(item: dict) -> str:
+        c_val = str(item.get("contract") or item.get("role") or item.get("level") or "").strip().lower()
+        return classify_contract_role(c_val)
+
+    def _norm_name(item: dict) -> str:
+        return " ".join(clean_name_ignoring_id(item.get("user_name")).lower().split())
+
+    used_db: Set[int] = set()
+    matched_db_by_fidx: Dict[int, dict] = {}
+    for f_idx, f_split in enumerate(file_list):
+        f_role = _role_key_of(f_split)
+        f_code = clean_agent_code(str(f_split.get("user_code") or "").strip().lower())
+        f_name = _norm_name(f_split)
+
+        best_match_idx = None
+        for db_idx, db_item in enumerate(db_list):
+            if db_idx in used_db:
+                continue
+            db_role = _role_key_of(db_item)
+            if db_role != f_role:
+                continue
+            db_code = clean_agent_code(str(db_item.get("user_code") or "").strip().lower())
+            db_name = _norm_name(db_item)
+            if f_role == "agency" and db_role == "agency":
+                best_match_idx = db_idx
+                break
+            if f_code and db_code and (f_code == db_code or are_codes_matching(f_code, db_code)):
+                best_match_idx = db_idx
+                break
+            if f_name and db_name and (f_name == db_name or are_names_matching(f_name, db_name)):
+                best_match_idx = db_idx
+                break
+        if best_match_idx is None:
+            role_candidates = [
+                db_idx for db_idx, db_item in enumerate(db_list)
+                if db_idx not in used_db and _role_key_of(db_item) == f_role
+            ]
+            if len(role_candidates) == 1:
+                best_match_idx = role_candidates[0]
+        if best_match_idx is not None:
+            used_db.add(best_match_idx)
+            matched_db_by_fidx[f_idx] = db_list[best_match_idx]
+
+    diff_parts: List[str] = []
+    party_parts: List[str] = []
+    person_parts: List[str] = []
+
+    for f_idx, f_split in enumerate(file_list):
+        role_key = _role_key_of(f_split)
+        party = _ISSUE_PARTY_LABELS.get(role_key, role_key.replace("_", " ").title() or "Agent")
+        person = _issue_person_display(
+            str(f_split.get("user_name") or ""),
+            str(f_split.get("user_code") or ""),
+            role_key=role_key,
+            item=f_split,
+        )
+        file_val = float(f_split.get("commission_value") or 0.0)
+        db_s = matched_db_by_fidx.get(f_idx)
+        if db_s is None:
+            # Missing on DB side — treat file value as the gap (vs 0)
+            if abs(file_val) > tolerance or not db_list:
+                diff_parts.append(_format_difference_value(file_val))
+                party_parts.append(party)
+                person_parts.append(person or party)
+            continue
+        db_val = float(db_s.get("commission_value") or 0.0)
+        gap = abs(file_val - db_val)
+        if gap > tolerance:
+            diff_parts.append(_format_difference_value(gap))
+            party_parts.append(party)
+            person_parts.append(person or party)
+
+    if fee_file is not None and fee_db is not None:
+        try:
+            fee_gap = abs(float(fee_file) - float(fee_db))
+        except (TypeError, ValueError):
+            fee_gap = 0.0
+        if fee_gap > tolerance:
+            fee_txt = _format_difference_value(fee_gap)
+            if "Agency" not in party_parts:
+                diff_parts.append(fee_txt)
+                party_parts.append("Agency")
+                person_parts.append("MLB")
+            elif fee_txt not in diff_parts:
+                diff_parts.append(fee_txt)
+                party_parts.append("Agency")
+                person_parts.append("MLB")
+
+    if not diff_parts:
+        return "", "", ""
+    return (
+        "|".join(diff_parts),
+        " | ".join(party_parts),
+        " | ".join(person_parts),
+    )
+
+
 def stage2_db_verify_dataset(
     df_valid: pd.DataFrame,
     db_mgr: DatabaseManager,
@@ -2487,6 +2688,38 @@ def stage2_db_verify_dataset(
     unmatched_reasons = [""] * len(df_out)
     db_vals = [""] * len(df_out)
     file_vals = [""] * len(df_out)
+    created_ats = [""] * len(df_out)
+    updated_ats = [""] * len(df_out)
+    created_bys = [""] * len(df_out)
+    updated_bys = [""] * len(df_out)
+    differences = [""] * len(df_out)
+    issue_parties = [""] * len(df_out)
+    affected_persons = [""] * len(df_out)
+
+    def _set_audit(row_idx: int, db_rec: Optional[dict]):
+        ca, ua, cb, ub = format_commission_audit_fields(db_rec)
+        created_ats[row_idx] = ca
+        updated_ats[row_idx] = ua
+        created_bys[row_idx] = cb
+        updated_bys[row_idx] = ub
+
+    def _set_issue_summary(
+        row_idx: int,
+        file_splits: Optional[list],
+        db_splits: Optional[list],
+        fee_file: Optional[float] = None,
+        fee_db: Optional[float] = None,
+    ):
+        diff_s, party_s, person_s = build_unmatched_issue_summary(
+            file_splits,
+            db_splits,
+            tolerance=tolerance,
+            fee_file=fee_file,
+            fee_db=fee_db,
+        )
+        differences[row_idx] = diff_s
+        issue_parties[row_idx] = party_s
+        affected_persons[row_idx] = person_s
 
     matched_count = 0
     ambiguous_count = 0
@@ -2761,6 +2994,7 @@ def stage2_db_verify_dataset(
                         file_commission_split = build_file_commission_split(
                             tier_group, seq_col, agent_col, agent_name_col, contract_col, split_col
                         )
+                        _set_issue_summary(idx, file_commission_split, [])
                         carrier_comm_raw = str(row.get("Carrier Commission", "") or row.get(rate_col, "") or row.get(amt_col, "")).strip()
                         file_payout_method_str = str(row.get("Payout Method", "")).strip().upper()
                         
@@ -3009,6 +3243,7 @@ def stage2_db_verify_dataset(
                             unmatched_reasons[idx] = ""
                             db_vals[idx] = json.dumps(db_split_raw) if isinstance(db_split_raw, (list, dict)) else str(db_split_raw)
                             file_vals[idx] = file_split_json
+                            _set_audit(idx, matched_db_rec)
                             matched_count += 1
                         else:
                             if not period_found:
@@ -3016,6 +3251,7 @@ def stage2_db_verify_dataset(
                                 unmatched_reasons[idx] = f"No commission rule found in DB for period {file_fm} -> {expected_db_tm}."
                                 db_vals[idx] = "N/A"
                                 file_vals[idx] = file_split_json
+                                _set_issue_summary(idx, file_commission_split, [])
                                 unmatched_count += 1
                                 
                                 fee_val = 0.0
@@ -3099,6 +3335,14 @@ def stage2_db_verify_dataset(
                                     )
                                 db_vals[idx] = json.dumps(db_split_raw) if isinstance(db_split_raw, (list, dict)) else str(db_split_raw)
                                 file_vals[idx] = file_split_json
+                                _set_audit(idx, matched_db_rec)
+                                _set_issue_summary(
+                                    idx,
+                                    file_commission_split,
+                                    db_split_raw if isinstance(db_split_raw, list) else [],
+                                    fee_file=_file_fee_val,
+                                    fee_db=float(matched_db_rec.get("fee_amount") or 0.0) if matched_db_rec else None,
+                                )
                                 unmatched_count += 1
                                 
                                 if matched_commission_uuid and matched_db_rec:
@@ -3385,6 +3629,13 @@ def stage2_db_verify_dataset(
     df_out["Stage2_Unmatched_Reason"] = unmatched_reasons
     df_out["DB_Value"] = db_vals
     df_out["File_Value"] = file_vals
+    df_out["created_at"] = created_ats
+    df_out["updated_at"] = updated_ats
+    df_out["created_by"] = created_bys
+    df_out["updated_by"] = updated_bys
+    df_out["Difference"] = differences
+    df_out["Issue_Party"] = issue_parties
+    df_out["Affected_Person"] = affected_persons
 
     matched_mask = df_out["Stage2_Status"] == "MATCHED"
     ambiguous_mask = df_out["Stage2_Status"] == "AMBIGUOUS_SIMILAR_MATCH"
@@ -3832,21 +4083,9 @@ def export_phase2_reports(df_matched: pd.DataFrame, df_unmatched: pd.DataFrame, 
     return matched_path, unmatched_path
 
 
-def run_post_commission_payloads(
-    payloads: list,
-    output_dir: str,
-    auto_confirm: bool = True,
-) -> Set[str]:
-    """
-    POST-create policy commission rules (after delete). Never PUT.
-    Strips rule_uuid / helper fields. Returns set of successful policy numbers.
-    """
-    successful: Set[str] = set()
-    if not payloads:
-        return successful
-
+def _prepare_policy_commission_api(logger_name: str):
+    """Shared SSO + base URL setup for commission DELETE/POST helpers."""
     import logging
-    import urllib.request
 
     try:
         from dotenv import load_dotenv
@@ -3867,9 +4106,9 @@ def run_post_commission_payloads(
         from import_policy_commission import fetch_sso_token, confirm_payload
     except ImportError as ie:
         print(f"⚠️ Could not import API logic: {ie}")
-        return successful
+        return None
 
-    logger = logging.getLogger("AutoPostAfterDelete")
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         logger.addHandler(logging.StreamHandler())
@@ -3883,13 +4122,7 @@ def run_post_commission_payloads(
     token = fetch_sso_token(logger, sso_url, client_id, username, password)
     if not token:
         print("⚠️ Could not generate API token. Make sure .env credentials are set.")
-        return successful
-
-    post_url = f"{api_base}/api/v1/policy/commission"
-    fail_log = os.path.join(
-        output_dir, f"post_api_failures_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    )
-    confirm = auto_confirm
+        return None
 
     def _headers(tok: str) -> dict:
         h = {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"}
@@ -3899,25 +4132,201 @@ def run_post_commission_payloads(
             h["x-service-name"] = os.environ["X_SERVICE_NAME"]
         return h
 
+    return {
+        "logger": logger,
+        "api_base": api_base,
+        "token": token,
+        "sso_url": sso_url,
+        "client_id": client_id,
+        "username": username,
+        "password": password,
+        "headers": _headers,
+        "fetch_sso_token": fetch_sso_token,
+        "confirm_payload": confirm_payload,
+    }
+
+
+def run_delete_commission_uuids(
+    commission_uuids: list,
+    output_dir: str,
+) -> Tuple[Set[str], Set[str], Dict[str, str]]:
+    """
+    DELETE mismatched policy commission rows via
+    DELETE /api/v1/policy/commission/{uuid}.
+
+    HTTP 404 is treated as success (already deleted).
+    Returns (ok_uuids, failed_uuids, fail_reasons_by_uuid).
+    """
+    import urllib.error
+    import urllib.request
+
+    ok: Set[str] = set()
+    failed: Set[str] = set()
+    fail_reasons: Dict[str, str] = {}
+    uuids = [str(u).strip() for u in (commission_uuids or []) if str(u).strip()]
+    if not uuids:
+        return ok, failed, fail_reasons
+
+    api = _prepare_policy_commission_api("AutoDeleteMismatchCommission")
+    if not api:
+        for uid in uuids:
+            failed.add(uid)
+            fail_reasons[uid] = "Could not authenticate / prepare API client"
+        return ok, failed, fail_reasons
+
+    logger = api["logger"]
+    token = api["token"]
+    fail_log = os.path.join(
+        output_dir, f"delete_api_failures_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
+    print(f"\n🗑️  API DELETE {len(uuids)} mismatch rule(s) via /api/v1/policy/commission/{{uuid}} …")
+
+    for i, uid in enumerate(uuids, start=1):
+        url = f"{api['api_base']}/api/v1/policy/commission/{uid}"
+
+        def _delete_once(tok: str) -> Tuple[bool, Optional[str], str]:
+            req = urllib.request.Request(url, headers=api["headers"](tok), method="DELETE")
+            try:
+                with urllib.request.urlopen(req, timeout=30.0) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                    if i == 1 or i == len(uuids) or i % 25 == 0:
+                        logger.info(f"✅ [{i}/{len(uuids)}] DELETE {uid} → HTTP {resp.status} {body[:120]}")
+                    return True, tok, ""
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
+                if e.code == 404:
+                    if i == 1 or i == len(uuids) or i % 25 == 0:
+                        logger.info(f"✅ [{i}/{len(uuids)}] DELETE {uid} → already gone (HTTP 404)")
+                    return True, tok, ""
+                if e.code == 401:
+                    new_tok = api["fetch_sso_token"](
+                        logger, api["sso_url"], api["client_id"], api["username"], api["password"]
+                    )
+                    if new_tok:
+                        return _delete_once(new_tok)
+                logger.error(f"❌ [{i}/{len(uuids)}] DELETE {uid} failed (HTTP {e.code}): {err_body}")
+                return False, tok, f"HTTP {e.code}: {err_body}"
+            except Exception as err:
+                logger.error(f"❌ [{i}/{len(uuids)}] DELETE {uid} failed: {err}")
+                return False, tok, str(err)
+
+        success, token, err = _delete_once(token)
+        if success:
+            ok.add(uid)
+            if i == 1 or i == len(uuids) or i % 25 == 0:
+                print(f"   DELETE progress {i}/{len(uuids)}", flush=True)
+        else:
+            failed.add(uid)
+            fail_reasons[uid] = err or "DELETE failed"
+            print(f"   ❌ DELETE failed [{i}/{len(uuids)}] {uid}: {err}", flush=True)
+            with open(fail_log, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.datetime.now().isoformat()}] DELETE {uid}: {err}\n")
+
+    print(f"✅ API DELETE finished: {len(ok)}/{len(uuids)} succeeded.")
+    if failed:
+        print(f"⚠️ {len(failed)} DELETE(s) failed. Check logs at: {fail_log}")
+    return ok, failed, fail_reasons
+
+
+def run_post_commission_payloads(
+    payloads: list,
+    output_dir: str,
+    auto_confirm: bool = True,
+) -> Tuple[Set[str], List[dict]]:
+    """
+    POST-create policy commission rules (after delete). Never PUT.
+    Strips rule_uuid / helper fields.
+
+    Returns (successful_policy_numbers, per_payload_results) where each result has:
+      policyNumber, monthFrom, monthTo, status (Updated/Not Updated), reason
+    """
+    import urllib.error
+    import urllib.request
+
+    successful: Set[str] = set()
+    results: List[dict] = []
+    if not payloads:
+        return successful, results
+
+    api = _prepare_policy_commission_api("AutoPostAfterDelete")
+    if not api:
+        for payload in payloads:
+            results.append({
+                "policyNumber": str(payload.get("policyNumber") or "Unknown"),
+                "monthFrom": payload.get("monthFrom"),
+                "monthTo": payload.get("monthTo"),
+                "status": "Not Updated",
+                "reason": "Could not authenticate / prepare API client",
+            })
+        return successful, results
+
+    logger = api["logger"]
+    token = api["token"]
+    confirm_payload = api["confirm_payload"]
+    fetch_sso_token = api["fetch_sso_token"]
+
+    post_url = f"{api['api_base']}/api/v1/policy/commission"
+    fail_log = os.path.join(
+        output_dir, f"post_api_failures_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
+    confirm = auto_confirm
+    _headers = api["headers"]
+    sso_url = api["sso_url"]
+    client_id = api["client_id"]
+    username = api["username"]
+    password = api["password"]
+
     for idx, payload in enumerate(payloads):
         payload_to_send = dict(payload)
         diff_text = payload_to_send.pop("_diff_text", "")
         payload_to_send.pop("_issue_reason", None)
+        pol_num = str(payload.get("policyNumber") or payload_to_send.get("policyNumber") or "Unknown")
+        month_from = payload.get("monthFrom")
+        month_to = payload.get("monthTo")
         action = confirm_payload(
             logger, idx + 1, len(payloads), payload_to_send, confirm,
             action_name="POST", diff_text=diff_text,
         )
         if action == "quit":
+            results.append({
+                "policyNumber": pol_num,
+                "monthFrom": month_from,
+                "monthTo": month_to,
+                "status": "Not Updated",
+                "reason": "POST quit by user before this payload",
+            })
+            for rest in payloads[idx + 1:]:
+                results.append({
+                    "policyNumber": str(rest.get("policyNumber") or "Unknown"),
+                    "monthFrom": rest.get("monthFrom"),
+                    "monthTo": rest.get("monthTo"),
+                    "status": "Not Updated",
+                    "reason": "POST quit by user before this payload",
+                })
             break
         if action == "all":
             confirm = True
             action = "yes"
         if action == "skip":
+            results.append({
+                "policyNumber": pol_num,
+                "monthFrom": month_from,
+                "monthTo": month_to,
+                "status": "Not Updated",
+                "reason": "POST skipped by user",
+            })
             continue
         if action != "yes":
+            results.append({
+                "policyNumber": pol_num,
+                "monthFrom": month_from,
+                "monthTo": month_to,
+                "status": "Not Updated",
+                "reason": f"POST not confirmed (action={action})",
+            })
             continue
 
-        pol_num = str(payload_to_send.pop("policyNumber", payload.get("policyNumber", "Unknown")))
+        payload_to_send.pop("policyNumber", None)
         payload_to_send.pop("writingAgentName", None)
         payload_to_send.pop("rule_uuid", None)
         body = {k: v for k, v in payload_to_send.items() if not str(k).startswith("_")}
@@ -3950,7 +4359,7 @@ def run_post_commission_payloads(
                     enriched_splits.append(item)
             body["commissionSplit"] = enriched_splits
 
-        def _post_once(tok: str) -> Tuple[bool, Optional[str]]:
+        def _post_once(tok: str) -> Tuple[bool, Optional[str], str]:
             req = urllib.request.Request(
                 post_url,
                 data=json.dumps([body]).encode("utf-8"),
@@ -3961,7 +4370,7 @@ def run_post_commission_payloads(
                 with urllib.request.urlopen(req, timeout=30.0) as resp:
                     res_json = json.loads(resp.read().decode("utf-8"))
                     logger.info(f"✅ Success POSTing {pol_num}: {res_json}")
-                    return True, tok
+                    return True, tok, ""
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
                 if e.code == 401:
@@ -3971,21 +4380,145 @@ def run_post_commission_payloads(
                 logger.error(f"❌ Failed to POST {pol_num} (HTTP {e.code}): {err_body}")
                 with open(fail_log, "a", encoding="utf-8") as f:
                     f.write(f"[{datetime.datetime.now().isoformat()}] POST HTTP {e.code} for {pol_num}: {err_body}\n")
-                return False, tok
+                return False, tok, f"POST HTTP {e.code}: {err_body}"
             except Exception as err:
                 logger.error(f"❌ Failed to POST {pol_num}: {err}")
                 with open(fail_log, "a", encoding="utf-8") as f:
                     f.write(f"[{datetime.datetime.now().isoformat()}] POST Exception for {pol_num}: {err}\n")
-                return False, tok
+                return False, tok, f"POST exception: {err}"
 
-        ok, token = _post_once(token)
+        ok, token, err = _post_once(token)
         if ok:
             successful.add(pol_num)
+            results.append({
+                "policyNumber": pol_num,
+                "monthFrom": month_from,
+                "monthTo": month_to,
+                "status": "Updated",
+                "reason": "Successfully updated via API POST",
+            })
+        else:
+            results.append({
+                "policyNumber": pol_num,
+                "monthFrom": month_from,
+                "monthTo": month_to,
+                "status": "Not Updated",
+                "reason": err or "POST failed",
+            })
 
     if os.path.exists(fail_log):
         print(f"\n⚠️ Some POST calls failed. Check logs at: {fail_log}")
     print(f"✅ POST recreate finished: {len(successful)}/{len(payloads)} succeeded.")
-    return successful
+    return successful, results
+
+
+def write_policy_update_status_excel(
+    output_dir: str,
+    post_payloads: Optional[list] = None,
+    post_results: Optional[List[dict]] = None,
+    mismatch_payloads: Optional[list] = None,
+    deleted_ok: Optional[Set[str]] = None,
+    deleted_failed: Optional[Set[str]] = None,
+    delete_fail_reasons: Optional[Dict[str, str]] = None,
+    post_skipped_reason: Optional[str] = None,
+) -> str:
+    """
+    Write Excel: Policy No | Status (Updated/Not Updated) | Reason
+    after API DELETE + POST. One row per policy.
+    """
+    deleted_ok = deleted_ok or set()
+    deleted_failed = deleted_failed or set()
+    delete_fail_reasons = delete_fail_reasons or {}
+    post_results = post_results or []
+    post_payloads = post_payloads or []
+    mismatch_payloads = mismatch_payloads or []
+
+    uuid_to_policy: Dict[str, str] = {}
+    for p in mismatch_payloads:
+        uid = str((p or {}).get("rule_uuid") or "").strip()
+        pol = str((p or {}).get("policyNumber") or "").strip()
+        if uid and pol:
+            uuid_to_policy[uid] = pol
+
+    by_policy: Dict[str, dict] = {}
+
+    def _ensure(pol: str):
+        key = str(pol or "").strip() or "Unknown"
+        if key not in by_policy:
+            by_policy[key] = {
+                "Policy No": key,
+                "Status": "Not Updated",
+                "Reason": "",
+                "_ok": 0,
+                "_fail": 0,
+                "_reasons": [],
+            }
+        return by_policy[key]
+
+    for uid in deleted_failed:
+        pol = uuid_to_policy.get(uid, uid)
+        row = _ensure(pol)
+        row["_fail"] += 1
+        row["_reasons"].append(
+            f"API DELETE failed for {uid}: {delete_fail_reasons.get(uid, 'unknown error')}"
+        )
+
+    for uid in deleted_ok:
+        pol = uuid_to_policy.get(uid)
+        if pol:
+            _ensure(pol)
+
+    if post_skipped_reason:
+        for p in post_payloads:
+            pol = str((p or {}).get("policyNumber") or "Unknown")
+            row = _ensure(pol)
+            row["_fail"] += 1
+            row["_reasons"].append(post_skipped_reason)
+    else:
+        for r in post_results:
+            pol = str(r.get("policyNumber") or "Unknown")
+            row = _ensure(pol)
+            if r.get("status") == "Updated":
+                row["_ok"] += 1
+            else:
+                row["_fail"] += 1
+                reason = str(r.get("reason") or "Not updated").strip()
+                mf, mt = r.get("monthFrom"), r.get("monthTo")
+                if mf is not None or mt is not None:
+                    reason = f"[months {mf}->{mt}] {reason}"
+                row["_reasons"].append(reason)
+
+        # Policies intended for POST but missing from results (shouldn't happen often)
+        seen_in_results = {str(r.get("policyNumber") or "") for r in post_results}
+        for p in post_payloads:
+            pol = str((p or {}).get("policyNumber") or "Unknown")
+            if pol not in seen_in_results:
+                row = _ensure(pol)
+                row["_fail"] += 1
+                row["_reasons"].append("No POST result recorded")
+
+    rows = []
+    for pol in sorted(by_policy.keys(), key=lambda x: str(x)):
+        info = by_policy[pol]
+        if info["_ok"] > 0 and info["_fail"] == 0:
+            status = "Updated"
+            reason = "Successfully updated via API"
+        elif info["_ok"] > 0 and info["_fail"] > 0:
+            status = "Not Updated"
+            reason = (
+                f"Partial: {info['_ok']} slab(s) updated, {info['_fail']} failed. "
+                + "; ".join(info["_reasons"][:5])
+            )
+        else:
+            status = "Not Updated"
+            reason = "; ".join(info["_reasons"][:8]) if info["_reasons"] else "Not updated"
+        rows.append({"Policy No": info["Policy No"], "Status": status, "Reason": reason})
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(output_dir, f"policy_update_status_{ts}.xlsx")
+    os.makedirs(output_dir, exist_ok=True)
+    pd.DataFrame(rows, columns=["Policy No", "Status", "Reason"]).to_excel(out_path, index=False)
+    return out_path
 
 
 def main():
@@ -4019,17 +4552,17 @@ def main():
     parser.add_argument(
         "--skip-delete-gate",
         action="store_true",
-        help="Skip delete MD + confirm (use with --force-post-mismatches when delete already done)",
+        help="Skip interactive delete/POST confirm (use with --force-post-mismatches or --post-missing-only)",
     )
     parser.add_argument(
         "--force-post-mismatches",
         action="store_true",
-        help="Delete already done: skip confirm and AUTO-POST all missing/mismatch rules now",
+        help="API-DELETE mismatch uuids via /api/v1/policy/commission/{uuid}, then AUTO-POST missing+mismatch rules",
     )
     parser.add_argument(
         "--post-missing-only",
         action="store_true",
-        help="Exclude mismatch rules from AUTO-POST; only POST missing-in-DB rules (no delete required)",
+        help="Exclude mismatch rules from AUTO-POST; only POST missing-in-DB rules (no API delete)",
     )
 
     args = parser.parse_args()
@@ -4624,12 +5157,12 @@ def main():
     successful_policies = set()
 
     # ------------------------------------------------------------------
-    # FLOW: delete SQL -> approve -> POST recreate (no PUT)
-    #   1) Write DELETE for mismatched policy_commission.uuid values only
+    # FLOW: API DELETE mismatches -> POST recreate (no PUT)
+    #   1) Collect mismatched policy_commission.uuid values
     #   2) Optionally exclude mismatches from POST (missing-only)
-    #   3) Wait for human: delete done / remaining=0 (when posting mismatches)
-    #   4) On y: auto-POST selected create payloads (strip old rule_uuid)
-    # Matched slabs are not in the DELETE and are not posted.
+    #   3) On confirm / --force-post-mismatches: DELETE each uuid via
+    #      DELETE /api/v1/policy/commission/{uuid}, then POST recreate
+    # Matched slabs are not deleted and are not posted.
     # ------------------------------------------------------------------
     def _dedupe_post_payloads(payloads):
         deduped = []
@@ -4647,6 +5180,13 @@ def main():
             deduped.append(p)
         return deduped
 
+    from generate_delete_commission_sql import (
+        mismatch_commission_uuids,
+        write_mismatch_delete_sql,
+    )
+
+    mismatch_uuids = mismatch_commission_uuids(unique_mismatch_payloads)
+    delete_line_count = len(mismatch_uuids)
     missing_only = bool(getattr(args, "post_missing_only", False))
     # --force-post-mismatches means include mismatches; it wins over --post-missing-only
     if args.force_post_mismatches:
@@ -4656,68 +5196,83 @@ def main():
         list(unique_missing_payloads or []) + list(unique_mismatch_payloads or [])
     )
     post_payloads = all_candidate_payloads
+    do_api_delete = False
+
+    # Always generate the mismatch DELETE SQL (UUID list) when there is anything to delete.
+    delete_sql_path = None
+    if mismatch_uuids:
+        delete_md_path = os.path.join(output_dir, "delete_commission_agency5.sql")
+        docs_md_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "docs", "delete_commission_agency5.sql"
+        )
+        try:
+            delete_sql_path = write_mismatch_delete_sql(
+                out_path=delete_md_path,
+                agency_id=agency_id,
+                commission_uuids=mismatch_uuids,
+            )
+            try:
+                write_mismatch_delete_sql(
+                    out_path=docs_md_path,
+                    agency_id=agency_id,
+                    commission_uuids=mismatch_uuids,
+                )
+            except Exception:
+                pass
+        except Exception as de:
+            print(f"⚠️ Could not write delete SQL: {de}")
 
     if not all_candidate_payloads:
         print("\nℹ️ No missing/mismatch payloads to recreate via POST.")
+        if delete_line_count:
+            print(f"   (Mismatch delete SQL still lists {delete_line_count} line(s) that would be deleted.)")
+            if delete_sql_path:
+                print(f"   SQL: {delete_sql_path}")
     elif args.skip_delete_gate and not args.force_post_mismatches and not missing_only:
         print("\n⏩ --skip-delete-gate set without --force-post-mismatches: skipping delete gate and POST recreate.")
-        print("   Use --force-post-mismatches to POST after delete is already done,")
+        print(f"   Lines that will be deleted (if you later API-DELETE mismatches): {delete_line_count}")
+        if delete_sql_path:
+            print(f"   Delete SQL generated: {delete_sql_path}")
+        print("   Use --force-post-mismatches to API-DELETE mismatches then POST,")
         print("   or --post-missing-only to POST missing rules without delete.")
     else:
         delete_approved = bool(args.force_post_mismatches) or (
             bool(args.skip_delete_gate) and missing_only
         )
+        if args.force_post_mismatches:
+            do_api_delete = bool(mismatch_uuids)
+            print(f"\n🗑️  --force-post-mismatches: lines that will be deleted via API: {delete_line_count}")
+            if delete_sql_path:
+                print(f"   Delete SQL generated: {delete_sql_path}")
+
         if not args.force_post_mismatches and not (args.skip_delete_gate and missing_only):
             print("\n" + "=" * 80)
-            print("FLOW STEP 1/2 — DELETE GATE (share SQL with senior eng)")
+            print("FLOW STEP 1/2 — API DELETE GATE")
             print("=" * 80)
-            from generate_delete_commission_sql import (
-                mismatch_commission_uuids,
-                write_mismatch_delete_sql,
-            )
-
-            mismatch_uuids = mismatch_commission_uuids(unique_mismatch_payloads)
             invalid_mismatch_rows = [
                 p for p in (invalid_user_uuid_payloads or []) if str(p.get("rule_uuid") or "").strip()
             ]
             print(f"Rules available to create: {len(all_candidate_payloads)}")
             print(f"  - missing in DB (no delete): {len(unique_missing_payloads or [])}")
-            print(f"  - mismatch rows to delete:   {len(mismatch_uuids)}")
-            print("  - matched slabs are omitted from the DELETE and are not posted")
+            print(f"  - mismatch rows to delete:   {delete_line_count}")
+            print(f"  - lines that will be deleted: {delete_line_count}")
+            print("  - endpoint: DELETE /api/v1/policy/commission/{uuid}")
+            print("  - matched slabs are omitted from DELETE and are not posted")
             if invalid_mismatch_rows:
                 print(
                     f"  - mismatch rows left in place (split checks failed, so they are not deleted): "
                     f"{len(invalid_mismatch_rows)}"
                 )
-            delete_md_path = os.path.join(output_dir, "delete_commission_agency5.sql")
-            docs_md_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "docs", "delete_commission_agency5.sql"
-            )
-            try:
-                abs_delete = write_mismatch_delete_sql(
-                    out_path=delete_md_path,
-                    agency_id=agency_id,
-                    commission_uuids=mismatch_uuids,
-                )
-                try:
-                    write_mismatch_delete_sql(
-                        out_path=docs_md_path,
-                        agency_id=agency_id,
-                        commission_uuids=mismatch_uuids,
-                    )
-                except Exception:
-                    pass
-                print(f"Raw delete SQL: {abs_delete}")
-                print("Share with senior eng. Script does NOT run DELETE.")
-            except Exception as de:
-                print(f"⚠️ Could not write delete SQL: {de}")
+            if delete_sql_path:
+                print(f"Delete SQL generated ({delete_line_count} uuid line(s)): {delete_sql_path}")
+            else:
+                print("⚠️ Delete SQL was not generated.")
 
-            # Ask whether to drop mismatch rules from this POST (safe without DELETE)
             if mismatch_uuids and not missing_only:
                 exclude_prompt = (
-                    "\nExclude mismatch rules from this POST?\n"
-                    "  y = POST missing-in-DB only (safe now; leave mismatches for later)\n"
-                    "  n = include mismatches (requires DELETE remaining=0 first)\n"
+                    "\nExclude mismatch rules from this update?\n"
+                    "  y = POST missing-in-DB only (no API delete)\n"
+                    "  n = API-DELETE mismatches, then POST missing + mismatches\n"
                     "Type 'y' or 'n': "
                 )
                 exclude_ans = input(exclude_prompt).strip().lower()
@@ -4725,8 +5280,9 @@ def main():
 
             if missing_only:
                 post_payloads = _dedupe_post_payloads(list(unique_missing_payloads or []))
+                do_api_delete = False
                 print(
-                    f"\n➡️ Mismatch POST eliminated for this run. "
+                    f"\n➡️ Mismatch API-DELETE/POST eliminated for this run. "
                     f"Will POST missing only: {len(post_payloads)} payload(s)."
                 )
                 if not post_payloads:
@@ -4742,13 +5298,16 @@ def main():
             elif mismatch_uuids:
                 post_payloads = all_candidate_payloads
                 confirm_prompt = (
-                    "\nFLOW STEP 2/2 — Mismatch rows deleted and remaining=0?\n"
-                    "Type 'y' to AUTO-POST missing and mismatch rules now (n to stop): "
+                    f"\nFLOW STEP 2/2 — API-DELETE {delete_line_count} line(s) "
+                    "via /api/v1/policy/commission/{{uuid}}, then POST recreate?\n"
+                    "Type 'y' to DELETE + POST now (n to stop): "
                 )
                 confirm_del = input(confirm_prompt).strip().lower()
                 delete_approved = confirm_del in ("y", "yes")
+                do_api_delete = delete_approved
             else:
                 post_payloads = all_candidate_payloads
+                do_api_delete = False
                 confirm_prompt = (
                     "\nFLOW STEP 2/2 — No mismatch rows to delete.\n"
                     "Type 'y' to AUTO-POST missing rules now (n to stop): "
@@ -4757,17 +5316,42 @@ def main():
                 delete_approved = confirm_del in ("y", "yes")
         elif missing_only:
             post_payloads = _dedupe_post_payloads(list(unique_missing_payloads or []))
+            do_api_delete = False
             print(
                 f"\n➡️ --post-missing-only: POST missing only "
                 f"({len(post_payloads)} payload(s); mismatches excluded)."
             )
+
+        deleted_ok: Set[str] = set()
+        deleted_failed: Set[str] = set()
+        delete_fail_reasons: Dict[str, str] = {}
+        post_results: List[dict] = []
+        post_skipped_reason: Optional[str] = None
+
+        if delete_approved and do_api_delete and mismatch_uuids:
+            print(f"\n🗑️  Deleting {delete_line_count} mismatch line(s) via API…")
+            if delete_sql_path:
+                print(f"   SQL reference: {delete_sql_path}")
+            deleted_ok, deleted_failed, delete_fail_reasons = run_delete_commission_uuids(
+                commission_uuids=mismatch_uuids,
+                output_dir=output_dir,
+            )
+            if deleted_failed:
+                print(
+                    f"⚠️ Stopping before POST: {len(deleted_failed)} mismatch DELETE(s) failed "
+                    f"({len(deleted_ok)} succeeded)."
+                )
+                delete_approved = False
+                post_skipped_reason = (
+                    f"POST skipped because API DELETE failed for {len(deleted_failed)} uuid(s)"
+                )
 
         if delete_approved and post_payloads:
             scope = "missing only" if missing_only else "missing + mismatch"
             print("\n" + "=" * 80)
             print(f"FLOW — AUTO-POST recreate ({scope}): {len(post_payloads)} payload(s) (no PUT)")
             print("=" * 80)
-            successful_policies = run_post_commission_payloads(
+            successful_policies, post_results = run_post_commission_payloads(
                 payloads=post_payloads,
                 output_dir=output_dir,
                 auto_confirm=True,
@@ -4775,10 +5359,27 @@ def main():
         elif delete_approved and not post_payloads:
             print("\nℹ️ Nothing to POST.")
         else:
-            print("Stopped before POST. After delete is done, re-run:")
+            print("Stopped before API DELETE/POST. Re-run:")
             print("  python validate_policy_commission_db.py -y --force-post-mismatches --skip-delete-gate")
             print("Or to POST missing only (no delete):")
             print("  python validate_policy_commission_db.py -y --post-missing-only --skip-delete-gate")
+
+        # Always emit Policy No / Status / Reason after a delete and/or post attempt
+        if post_results or post_skipped_reason or deleted_ok or deleted_failed:
+            try:
+                status_path = write_policy_update_status_excel(
+                    output_dir=output_dir,
+                    post_payloads=post_payloads,
+                    post_results=post_results,
+                    mismatch_payloads=unique_mismatch_payloads,
+                    deleted_ok=deleted_ok,
+                    deleted_failed=deleted_failed,
+                    delete_fail_reasons=delete_fail_reasons,
+                    post_skipped_reason=post_skipped_reason,
+                )
+                print(f"\n📊 Policy update status Excel: {status_path}")
+            except Exception as ste:
+                print(f"⚠️ Could not write policy update status Excel: {ste}")
 
     if successful_policies:
         pol_col_s2 = next((c for c in df_stage2_unmatched.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
