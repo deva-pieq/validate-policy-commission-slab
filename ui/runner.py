@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import glob
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -121,6 +123,9 @@ DB_ARTIFACT_PATTERNS = [
     "update_writing_agent_from_file.sql",
     "writing_agent_corrections_*.json",
     "post_api_failures_*.log",
+    "delete_api_failures_*.log",
+    "policy_update_status_*.xlsx",
+    "updated_policies_*.csv",
 ]
 
 APL_ARTIFACT_PATTERNS = [
@@ -191,8 +196,8 @@ def build_db_validate_argv(
     """
     Validate-only argv.
 
-    Does NOT pass --skip-delete-gate so delete SQL + gate summary are still written.
-    Pair with stdin_decline_post() so prompts answer n and never POST.
+    Does NOT pass --skip-delete-gate so the API-delete gate summary is still written.
+    Pair with stdin_decline_post() so prompts answer n and never DELETE/POST.
     """
     return _db_base_argv(
         file_path,
@@ -375,16 +380,83 @@ def run_command(
     lines: List[str] = []
     cancelled = False
     exit_code = -1
+    # Always drain stdout on a background thread so a slow Streamlit UI callback
+    # cannot fill the OS pipe and freeze the child (DELETE/POST hang).
+    line_q: queue.Queue = queue.Queue()
+
+    def _drain_stdout():
+        """
+        Read the subprocess stdout byte-by-byte into logical lines.
+
+        The validator script uses both \\n (normal print) and \\r (progress
+        rewrites via sys.stdout.write).  Python's line iterator only splits on
+        \\n, so a \\r-only progress update (e.g. the Stage 2 chunked-verify bar)
+        arrives as part of the *previous* line and silently collapses everything
+        into a single wall of text in the UI.
+
+        Fix: read in raw-text mode (line delimiter = \\n), then split each
+        chunk on \\r so every carriage-return rewrite becomes its own entry.
+        Only the last fragment of a \\r sequence is kept (mimicking terminal
+        behaviour where \\r moves back to column 0 and overwrites).
+        """
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                # raw_line ends with \n (or EOF); may contain embedded \r
+                # e.g. "\r ⚡ [Stage 2…] 50/100 …\r ⚡ [Stage 2…] 100/100 …\n"
+                parts = raw_line.split("\r")
+                # Emit all but the last part (they are overwritten rewrites)
+                for part in parts[:-1]:
+                    cleaned = part.strip("\r\n")
+                    if cleaned:
+                        line_q.put(cleaned + "\n")
+                # Always emit the last part (it ends with \n or is the final fragment)
+                last = parts[-1]
+                if last.strip("\r\n"):
+                    line_q.put(last if last.endswith("\n") else last + "\n")
+        except Exception as read_err:
+            line_q.put(read_err)
+        finally:
+            line_q.put(None)
+
+    reader = threading.Thread(target=_drain_stdout, name="ui-stdout-drain", daemon=True)
+    reader.start()
+
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            lines.append(line)
+        while True:
+            try:
+                item = line_q.get(timeout=0.25)
+            except queue.Empty:
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    handle.cancel()
+                    break
+                continue
+
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+
+            lines.append(item)
             if on_line:
-                on_line(line.rstrip("\n"))
+                on_line(item.rstrip("\n\r"))
             if cancel_check and cancel_check():
                 cancelled = True
                 handle.cancel()
                 break
+
+        # Consume any remaining drained lines after cancel so the reader can exit
+        while True:
+            try:
+                item = line_q.get_nowait()
+            except queue.Empty:
+                break
+            if item is None or isinstance(item, Exception):
+                break
+            lines.append(item)
+
+        reader.join(timeout=5)
         exit_code = proc.wait()
     except Exception:
         handle.cancel()
@@ -421,7 +493,11 @@ def parse_gate_hints(log_text: str) -> dict:
                 hints["missing"] = int(s.rsplit(":", 1)[-1].strip())
             except ValueError:
                 pass
-        elif "mismatch rows to delete" in s and ":" in s:
+        elif (
+            "mismatch rows to delete" in s
+            or "mismatch rows to API-DELETE" in s
+            or "lines that will be deleted" in s.lower()
+        ) and ":" in s:
             try:
                 hints["mismatch_delete"] = int(s.rsplit(":", 1)[-1].strip())
             except ValueError:
