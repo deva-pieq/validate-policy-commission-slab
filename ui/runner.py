@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import glob
 import os
 import queue
@@ -19,7 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 UPLOADS_DIR = REPO_ROOT / "ui_uploads"
 DB_OUTPUT_ROOT = REPO_ROOT / "pipeline_output" / "commission_validation_db"
 
-LogCallback = Callable[[str], None]
+# on_line(text, replace): replace=True overwrites the previous (progress) line
+LogCallback = Callable[[str, bool], None]
 
 
 @dataclass
@@ -350,8 +352,11 @@ def run_command(
     started = time.time()
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"  # emoji in the validator's prints
     workdir = cwd or str(REPO_ROOT)
 
+    # Binary pipe: text mode turns every \r into a new line, so the Stage 2
+    # progress bar (\r rewrites) flooded the log with thousands of lines.
     popen_kwargs = {
         "args": argv,
         "cwd": workdir,
@@ -359,8 +364,7 @@ def run_command(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-        "text": True,
-        "bufsize": 1,
+        "bufsize": 0,
     }
     if sys.platform != "win32":
         popen_kwargs["start_new_session"] = True  # own process group for cancel
@@ -372,7 +376,7 @@ def run_command(
 
     if stdin_text is not None and proc.stdin is not None:
         try:
-            proc.stdin.write(stdin_text)
+            proc.stdin.write(stdin_text.encode("utf-8"))
             proc.stdin.close()
         except BrokenPipeError:
             pass
@@ -386,34 +390,53 @@ def run_command(
 
     def _drain_stdout():
         """
-        Read the subprocess stdout byte-by-byte into logical lines.
+        Read the child's stdout as raw bytes and turn it into log entries.
 
-        The validator script uses both \\n (normal print) and \\r (progress
-        rewrites via sys.stdout.write).  Python's line iterator only splits on
-        \\n, so a \\r-only progress update (e.g. the Stage 2 chunked-verify bar)
-        arrives as part of the *previous* line and silently collapses everything
-        into a single wall of text in the UI.
-
-        Fix: read in raw-text mode (line delimiter = \\n), then split each
-        chunk on \\r so every carriage-return rewrite becomes its own entry.
-        Only the last fragment of a \\r sequence is kept (mimicking terminal
-        behaviour where \\r moves back to column 0 and overwrites).
+        Each queue item is (text, is_progress). A segment that follows a bare
+        \r is a progress rewrite (the Stage 2 bar): the consumer overwrites the
+        previous progress entry instead of adding a line, like a terminal does.
+        A \r\n pair is a normal line end.
         """
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pending = ""
+        after_cr = False
+
+        def _emit(segment: str, progress: bool):
+            if segment.strip():
+                line_q.put((segment.rstrip(), progress))
+
         try:
             assert proc.stdout is not None
-            for raw_line in proc.stdout:
-                # raw_line ends with \n (or EOF); may contain embedded \r
-                # e.g. "\r ⚡ [Stage 2…] 50/100 …\r ⚡ [Stage 2…] 100/100 …\n"
-                parts = raw_line.split("\r")
-                # Emit all but the last part (they are overwritten rewrites)
-                for part in parts[:-1]:
-                    cleaned = part.strip("\r\n")
-                    if cleaned:
-                        line_q.put(cleaned + "\n")
-                # Always emit the last part (it ends with \n or is the final fragment)
-                last = parts[-1]
-                if last.strip("\r\n"):
-                    line_q.put(last if last.endswith("\n") else last + "\n")
+            fd = proc.stdout.fileno()
+            while True:
+                chunk = os.read(fd, 8192)
+                text = decoder.decode(chunk, final=not chunk)
+                pending += text
+                # Process every complete separator; keep a trailing \r pending
+                # until we know whether it is part of \r\n.
+                while True:
+                    i_n = pending.find("\n")
+                    i_r = pending.find("\r")
+                    if i_n < 0 and i_r < 0:
+                        break
+                    if i_r >= 0 and (i_n < 0 or i_r < i_n):
+                        if i_r == len(pending) - 1 and chunk:
+                            break  # wait for the next byte
+                        if pending[i_r + 1:i_r + 2] == "\n":
+                            _emit(pending[:i_r], after_cr)
+                            pending = pending[i_r + 2:]
+                            after_cr = False
+                        else:
+                            _emit(pending[:i_r], after_cr)
+                            pending = pending[i_r + 1:]
+                            after_cr = True
+                    else:
+                        _emit(pending[:i_n], after_cr)
+                        pending = pending[i_n + 1:]
+                        after_cr = False
+                if not chunk:
+                    _emit(pending.replace("\r", ""), after_cr)
+                    break
         except Exception as read_err:
             line_q.put(read_err)
         finally:
@@ -421,6 +444,20 @@ def run_command(
 
     reader = threading.Thread(target=_drain_stdout, name="ui-stdout-drain", daemon=True)
     reader.start()
+
+    last_was_progress = False
+
+    def _take(item) -> None:
+        nonlocal last_was_progress
+        text, progress = item
+        replace = progress and last_was_progress and bool(lines)
+        if replace:
+            lines[-1] = text + "\n"
+        else:
+            lines.append(text + "\n")
+        last_was_progress = progress
+        if on_line:
+            on_line(text, replace)
 
     try:
         while True:
@@ -438,9 +475,7 @@ def run_command(
             if isinstance(item, Exception):
                 raise item
 
-            lines.append(item)
-            if on_line:
-                on_line(item.rstrip("\n\r"))
+            _take(item)
             if cancel_check and cancel_check():
                 cancelled = True
                 handle.cancel()
@@ -454,7 +489,7 @@ def run_command(
                 break
             if item is None or isinstance(item, Exception):
                 break
-            lines.append(item)
+            _take(item)
 
         reader.join(timeout=5)
         exit_code = proc.wait()
@@ -485,9 +520,23 @@ def parse_gate_hints(log_text: str) -> dict:
         "mismatch_delete": None,
         "invalid_left_in_place": None,
         "rules_available": None,
+        "missing_post": None,
+        "mismatch_post": None,
+        "delete": None,
+        "blocked": None,
     }
     for line in log_text.splitlines():
         s = line.strip()
+        # Exact counts printed by the validator: "GATE_SUMMARY missing_post=0 mismatch_post=0 delete=0 blocked=0"
+        if s.startswith("GATE_SUMMARY"):
+            for tok in s.split()[1:]:
+                k, _, v = tok.partition("=")
+                if k in hints:
+                    try:
+                        hints[k] = int(v)
+                    except ValueError:
+                        pass
+            continue
         if "missing in DB" in s and ":" in s:
             try:
                 hints["missing"] = int(s.rsplit(":", 1)[-1].strip())
@@ -515,4 +564,16 @@ def parse_gate_hints(log_text: str) -> dict:
         # Also catch unmatched summary lines
         elif "Unmatched Rows:" in s:
             pass
+    if hints["missing_post"] is not None:
+        hints["missing"] = hints["missing_post"]
+    if hints["delete"] is not None:
+        hints["mismatch_delete"] = hints["delete"]
     return hints
+
+
+def gate_has_work(hints: dict) -> Optional[bool]:
+    """True if the run left something to delete or post, False if nothing, None if unknown."""
+    keys = ("missing_post", "mismatch_post", "delete")
+    if any(hints.get(k) is None for k in keys):
+        return None
+    return any((hints.get(k) or 0) > 0 for k in keys)

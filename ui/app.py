@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import dotenv_values
 
 from runner import (
@@ -27,6 +28,7 @@ from runner import (
     build_apl_argv,
     build_db_post_argv,
     build_db_validate_argv,
+    gate_has_work,
     list_artifacts,
     parse_gate_hints,
     run_command,
@@ -178,25 +180,52 @@ def _sidebar_common(env: dict) -> dict:
     return {"agency_id": int(agency_id), "env_file": env_file}
 
 
+LOG_MAX_CHARS = 80000
+LOG_BOX_HEIGHT = 520
+
+
+def _log_tail(text: str) -> str:
+    """Last LOG_MAX_CHARS of the log, cut at a line start so no line is half shown."""
+    if not text or len(text) <= LOG_MAX_CHARS:
+        return text or ""
+    tail = text[-LOG_MAX_CHARS:]
+    nl = tail.find("\n")
+    return "… (earlier lines trimmed)\n" + (tail[nl + 1:] if nl >= 0 else tail)
+
+
 def _render_log(placeholder, text: str):
-    body = html.escape(text[-80000:] if text else "(waiting for output…)")
-    placeholder.markdown(
-        f'<pre class="ui-log-scroll" id="ui-log-scroll-box">{body}</pre>'
-        # Auto-scroll to bottom so the latest line is always visible
-        '<script>'
-        'var el=document.getElementById("ui-log-scroll-box");'
-        'if(el){el.scrollTop=el.scrollHeight;}'
-        '</script>',
-        unsafe_allow_html=True,
-    )
+    """Show the log in a scrolling dark box that stays pinned to the newest line.
+
+    Rendered in a components iframe, not st.markdown: markdown ends an HTML block at
+    the first blank line (the rest of the log was parsed as markdown, so ==== became
+    headings and | became tables) and strips <script>, so auto-scroll never ran.
+    """
+    body = html.escape(_log_tail(text) or "(waiting for output…)")
+    doc = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{{margin:0;height:100%;background:#0d1117;}}
+pre{{box-sizing:border-box;height:100%;margin:0;overflow:auto;white-space:pre-wrap;
+word-break:break-word;font-family:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;
+font-size:12.5px;line-height:1.5;color:#e6edf3;background:#0d1117;padding:12px 16px;
+border:1px solid #30363d;border-radius:8px;tab-size:4;}}
+</style></head><body><pre id="log">{body}</pre><script>
+var el=document.getElementById("log");el.scrollTop=el.scrollHeight;
+</script></body></html>"""
+    with placeholder.container():
+        components.html(doc, height=LOG_BOX_HEIGHT, scrolling=False)
 
 
 def _make_throttled_on_line(buf: List[str], state_key: str, log_box, every_n: int = 25, every_s: float = 0.75):
-    """Append lines always; refresh the UI log only periodically (keeps UI responsive)."""
+    """Append lines always; refresh the UI log only periodically (keeps UI responsive).
+
+    replace=True (Stage 2 progress bar) overwrites the last line instead of adding one.
+    """
     state = {"n": 0, "last": 0.0}
 
-    def on_line(line: str):
-        buf.append(line)
+    def on_line(line: str, replace: bool = False):
+        if replace and buf:
+            buf[-1] = line
+        else:
+            buf.append(line)
         st.session_state[state_key] = "\n".join(buf)
         state["n"] += 1
         now = time.time()
@@ -311,8 +340,11 @@ def tab_db_validation(shared: dict, env: dict):
                 status_box.error(f"Validation exited with code {result.exit_code}.")
 
     if st.session_state.db_log:
-        with st.expander("Live / last console log", expanded=True):
-            st.code(st.session_state.db_log[-80000:], language="text")
+        # Keep the last log in the same box after reruns (download clicks etc.)
+        if not run_clicked:
+            _render_log(log_box, st.session_state.db_log)
+        with st.expander("Copy full console log", expanded=False):
+            st.code(_log_tail(st.session_state.db_log), language="text")
 
     result = st.session_state.db_result
     if result and result.output_dir:
@@ -322,9 +354,20 @@ def tab_db_validation(shared: dict, env: dict):
         _download_buttons(artifacts, "db_art")
 
         hints = parse_gate_hints(result.log_text or "")
-        # If validate-only skipped the gate printout, still show POST panel
         st.markdown("---")
         st.markdown("### Update gate (optional API DELETE + POST recreate)")
+        if gate_has_work(hints) is False:
+            blocked = hints.get("blocked") or 0
+            st.success(
+                "Nothing to delete or post: every rule in the file already matches the DB, "
+                "or was set aside in the reports."
+            )
+            if blocked:
+                st.warning(
+                    f"{blocked} rule(s) were held back because their split failed the checks. "
+                    "See rejected_missing_user_uuid_payloads_*.json in the reports."
+                )
+            return
         st.info(
             "Mismatch delete uses `DELETE /api/v1/policy/commission/{uuid}`. "
             "`delete_commission_agency5.sql` is still generated with the UUID list."
@@ -370,7 +413,8 @@ def tab_db_validation(shared: dict, env: dict):
 
         post_log_box = st.empty()
         post_status = st.empty()
-        if st.button("Confirm update", type="primary", disabled=post_mode == "skip", key="post_go"):
+        post_clicked = st.button("Confirm update", type="primary", disabled=post_mode == "skip", key="post_go")
+        if post_clicked:
             if post_mode == "with_mismatches" and not confirm_delete:
                 st.error("Confirm API DELETE + POST before continuing.")
             elif not st.session_state.db_file_path:
@@ -415,8 +459,10 @@ def tab_db_validation(shared: dict, env: dict):
                     post_status.error(f"POST run exited with code {post_result.exit_code}.")
 
         if st.session_state.post_log:
-            with st.expander("POST console log", expanded=True):
-                st.code(st.session_state.post_log[-80000:], language="text")
+            if not post_clicked:
+                _render_log(post_log_box, st.session_state.post_log)
+            with st.expander("Copy full POST console log", expanded=False):
+                st.code(_log_tail(st.session_state.post_log), language="text")
             if st.session_state.post_result and st.session_state.post_result.output_dir:
                 st.markdown("#### Post-run reports")
                 _download_buttons(
@@ -495,8 +541,10 @@ def tab_apl_validation(shared: dict, env: dict):
                 status_box.error(f"APL validation exited with code {result.exit_code}.")
 
     if st.session_state.apl_log:
-        with st.expander("Live / last console log", expanded=True):
-            st.code(st.session_state.apl_log[-80000:], language="text")
+        if not run_clicked:
+            _render_log(log_box, st.session_state.apl_log)
+        with st.expander("Copy full console log", expanded=False):
+            st.code(_log_tail(st.session_state.apl_log), language="text")
 
     result = st.session_state.apl_result
     if result and result.output_dir:
