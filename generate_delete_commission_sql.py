@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Raw DELETE SQL for mismatched policy_commission rows (agency_id=5).
+Audit SQL listing mismatched policy_commission.uuid values (agency_id=5).
 
-The validation run writes this file. It deletes by policy_commission.uuid for
-slabs that do not match the sheet. Policies whose slabs all match are omitted.
-Missing slabs have no row to delete.
+The validation run writes this file for reference. Live mismatch delete is done
+via DELETE /api/v1/policy/commission/{uuid} in validate_policy_commission_db.py.
+Policies whose slabs all match are omitted. Missing slabs have no row to delete.
 
-Does NOT run DELETE.
+Does NOT run DELETE against the database.
 Output is raw SQL only (.sql): BEGIN / DELETE / ROLLBACK.
 """
 

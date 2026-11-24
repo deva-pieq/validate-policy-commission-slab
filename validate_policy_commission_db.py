@@ -278,6 +278,66 @@ def lookup_policy_db_records(chunk_db_map: dict, policy_number: str, clean_prod_
     return list(pol_records) if pol_records else []
 
 
+def pick_policy_by_product(rows: list, normalized_name: str, file_name: str) -> Tuple[list, str]:
+    """Narrow DB rows that belong to several policies down to one policy by product.
+
+    Tries the normalized product name (from the normalization list) first. When the
+    product has no entry in that list (normalized name is the same as the file name)
+    or the normalized name finds nothing, the file product name is used. Each name is
+    tried as an exact match, then as a contains match.
+
+    Returns (rows of the single matching policy, "") or ([], reason) when the product
+    still points at more than one policy, or at none.
+    """
+    def _clean(s) -> str:
+        return " ".join(str(s or "").lower().split())
+
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    names = []
+    for name in (normalized_name, file_name):
+        cn = _clean(name)
+        if cn and cn != "nan" and cn not in names:
+            names.append(cn)
+    if not names:
+        return [], "no product name in the file to tell them apart"
+
+    for cn in names:
+        for mode in ("exact", "contains"):
+            if mode == "exact":
+                hits = [r for r in rows if _clean(r.get("product_name")) == cn]
+            else:
+                hits = [
+                    r for r in rows
+                    if _clean(r.get("product_name"))
+                    and (cn in _clean(r.get("product_name")) or _clean(r.get("product_name")) in cn)
+                ]
+            uuids = {str(r.get("policy_uuid") or "").strip() for r in hits}
+            uuids.discard("")
+            if len(uuids) == 1:
+                return hits, ""
+            if len(uuids) > 1:
+                return [], f"product '{cn}' still matches {len(uuids)} policies ({_db_products_text(rows)})"
+    return [], (
+        f"none of them has product {' / '.join(repr(n) for n in names)} "
+        f"({_db_products_text(rows)})"
+    )
+
+
+def _db_products_text(rows: list) -> str:
+    """'DB policies: <number> = <product>; ...' for the candidate rows (one entry per policy)."""
+    seen = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        key = str(r.get("policy_uuid") or "").strip() or str(r.get("policy_number") or "")
+        if key in seen:
+            continue
+        num = str(r.get("policy_number") or "").strip() or "?"
+        prod = str(r.get("product_name") or "").strip() or "no product"
+        seen[key] = f"{num} = '{prod}'"
+    return "DB policies: " + "; ".join(seen.values()) if seen else "DB policies: none"
+
+
 def parse_amount(val) -> float:
     """Parses currency strings or numeric values into float."""
     if pd.isna(val):
@@ -1054,23 +1114,188 @@ def commission_rule_name_for_type(commission_type: int) -> str:
     return "Carrier - Product - COMMISSION"
 
 
+# Overrides (product name with OVR) are ON HOLD: when False, override rows are set aside before
+# Stage 1 - no override check, no DELETE and no POST for them - and saved to their own Excel.
+# Set to True to enable override validation and updates again.
+OVERRIDE_UPDATES_ENABLED = False
+
+# Helper columns written by the override builder and read by Stage 1 / Stage 2.
+OVR_INVALID_COL = "_override_invalid_reason"
+OVR_SL_FROM_FILE_COL = "_override_sl_from_file"
+SPLIT_LEVEL_COL = "_split_level"
+SPLIT_USER_UUID_COL = "_split_user_uuid"
+
+
+def _clean_helper_text(val) -> str:
+    """Helper-column value as text; blank for None/NaN."""
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(val).strip()
+    return "" if text.lower() in ("nan", "none", "null") else text
+
+
+def _split_list(raw) -> list:
+    """commission_split as a list of dicts (DB returns list or JSON text)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [s for s in raw if isinstance(s, dict)]
+
+
+def rule_effective_type(rec: dict) -> int:
+    """The DB rule's stored commission_type (default 1).
+
+    An override is a rule stored as type 4. An Agency-100% split on a type-1 rule is a
+    regular commission (e.g. a renewal band where only the Agency is paid), not an override.
+    """
+    try:
+        return int(rec.get("commission_type") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def is_override_product(product_name) -> bool:
+    """A file row is an override when its product name carries OVR (e.g. 'Allstate OVR')."""
+    return bool(re.search(r"\bovr\b", str(product_name or "").lower()))
+
+
+def is_override_family(ctype) -> bool:
+    try:
+        return int(ctype) == 4
+    except (TypeError, ValueError):
+        return False
+
+
+def _hierarchy_people(splits: list) -> Dict[str, dict]:
+    """Sales Leader / Agent / Sub Agent from one DB split, with level, code and user uuid.
+
+    MLB is allowed as Sales Leader (legacy data has it there). MLB is never the Agent
+    or Sub Agent. Empty placeholder slots are skipped.
+    """
+    people: Dict[str, dict] = {}
+
+    def _order(item: dict) -> int:
+        try:
+            return int(item.get("order") or 999)
+        except (TypeError, ValueError):
+            return 999
+
+    for item in sorted(_split_list(splits), key=_order):
+        role = str(item.get("role") or "").strip().lower()
+        entity = str(item.get("entity") or "").strip().lower()
+        if role == "agency" or entity == "agency":
+            continue
+        name = " ".join(str(item.get("user_name") or "").split())
+        code = clean_agent_code(str(item.get("user_code") or "").strip())
+        uuid = str(item.get("user_uuid") or "").strip()
+        if not name and not code and not uuid:
+            continue
+        person = {
+            "name": name,
+            "code": code,
+            "uuid": uuid,
+            "level": str(item.get("level") or "").strip(),
+        }
+        if "sales" in role or "leader" in role:
+            people.setdefault("sales_leader", person)
+            continue
+        if _is_mlb_or_agency_person(name, code, item):
+            continue
+        if "sub" in role:
+            people.setdefault("sub_agent", person)
+        else:
+            people.setdefault("agent", person)
+    return people
+
+
+def _resolve_policy_records(result_map: dict, policy_number: str) -> Tuple[Optional[str], list, str]:
+    """DB rows for one policy: the exact number first, then legacy suffix candidates.
+
+    A suffix candidate is used only when it points at exactly one policy, the same rule
+    Stage 2 uses. People are never merged across candidates.
+    """
+    rows = result_map.get(policy_number) or []
+    if rows:
+        return policy_number, list(rows), ""
+    for cand in policy_suffix_candidates(policy_number):
+        rows = result_map.get(cand) or []
+        if not rows:
+            continue
+        uuids = {str(r.get("policy_uuid") or "").strip() for r in rows} - {""}
+        if len(uuids) > 1:
+            return None, [], f"policy number '{cand}' (suffix removed) matches {len(uuids)} policies"
+        return cand, list(rows), ""
+    return None, [], ""
+
+
+def _pick_people_source(records: list, band_from: int) -> Tuple[Dict[str, dict], str, str]:
+    """People for an override band, taken from one DB rule of the same policy.
+
+    Order: a regular (non-override) rule, preferring the same From Month; then an
+    existing DB override that already names a Sales Leader and Agent.
+    Returns (people, source_label, source_months).
+    """
+    with_split = [r for r in records if _split_list(r.get("commission_split"))]
+    regular = [r for r in with_split if rule_effective_type(r) != 4]
+    override = [r for r in with_split if rule_effective_type(r) == 4]
+
+    def _from(r) -> int:
+        return _month_to_int(r.get("month_from")) or 1
+
+    def _agency_only_paid(r) -> bool:
+        return is_override_commission_split(_split_list(r.get("commission_split")))
+
+    for label, pool in (("regular", regular), ("db_override", override)):
+        # Prefer a regular rule that actually pays the agents over an Agency-100% band
+        for rec in sorted(pool, key=lambda r: (_agency_only_paid(r), _from(r) != band_from, _from(r))):
+            people = _hierarchy_people(rec.get("commission_split"))
+            if "sales_leader" in people and "agent" in people:
+                to_m = rec.get("month_to")
+                months = f"{_from(rec)}-{to_m if to_m is not None else 'open'}"
+                return people, label, months
+    return {}, "", ""
+
+
 def ensure_override_three_rows(
     df: pd.DataFrame,
     db_mgr: Optional["DatabaseManager"] = None,
     agency_id: int = 5,
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    For override / agency-100% groups, ensure each month band has Agency + Sales Leader + Agent.
+    Make every override (OVR / Agency 100%) month band carry Agency + Sales Leader + Agent
+    (+ Sub Agent when there is one). Never leaves an Agency-only override.
 
-    Sheet pattern Agency + Broker:
-      - Agency stays MLB @ 100% (never move MLB into Sales Leader — that is the live-app bug)
-      - Broker = Agent @ 0% (Contract rewritten to Agent)
-      - Sales Leader = same Broker person @ 0%
+    People, per role:
+      - Agent:       the file's Agent/Broker row, else the DB rule's Agent
+      - Sales Leader: the file's Sales Leader row, else the DB rule's Sales Leader (MLB allowed)
+      - Sub Agent:   the file's Sub Agent row, else the DB rule's named Sub Agent
+    The DB rule is one rule on the same policy (exact number, then a legacy suffix
+    candidate): a regular rule first, then an existing DB override.
 
-    Agency-only: look up SL + Agent from DB (MLB/agency entries ignored).
+    Levels and user uuids come from that DB rule. Sequences follow the hierarchy:
+    Sub Agent < Agent < Sales Leader < Agency, so Agency keeps the 100%.
+
+    When a band cannot get an Agency, Sales Leader and Agent, every row of that
+    policy+product gets OVR_INVALID_COL and Stage 1 sends it to the invalid report.
+    Without a DB connection the old file-only fallback is used (Broker as Sales Leader).
     """
+    empty_summary = {
+        "groups_expanded": 0, "rows_appended": 0, "db_lookups": 0, "db_misses": 0,
+        "db_miss_policies": [], "invalid_groups": 0, "invalid_policies": [],
+    }
     if df is None or df.empty:
-        return df, {"groups_expanded": 0, "rows_appended": 0, "db_lookups": 0, "db_misses": 0}
+        return df, empty_summary
 
     pol_col = _find_col(df, ("policy no", "policy number", "policy", "policyno", "policy_number"))
     prod_col = _find_col(df, ("product", "product name", "product_description", "product_name"))
@@ -1090,249 +1315,222 @@ def ensure_override_three_rows(
 
     if not all([pol_col, prod_col, fm_col, tm_col, contract_col]):
         print("⚠️ Override 3-row expand skipped: missing required columns.")
-        return df.copy(), {"groups_expanded": 0, "rows_appended": 0, "skipped": True}
+        out = df.copy()
+        empty_summary["skipped"] = True
+        return out, empty_summary
 
-    # Preload DB people for agency-only override policies
-    db_people_by_pol: Dict[str, Dict[str, dict]] = {}
+    df = df.copy()
+    for col in (OVR_INVALID_COL, OVR_SL_FROM_FILE_COL, SPLIT_LEVEL_COL, SPLIT_USER_UUID_COL):
+        if col not in df.columns:
+            df[col] = ""
+    if not seq_col:
+        df["Sequence"] = 1
+        seq_col = "Sequence"
+
+    override_keys = [
+        key for key, group in df.groupby([pol_col, prod_col], sort=False)
+        if is_override_product(key[1])
+    ]
+    db_available = db_mgr is not None and bool(getattr(db_mgr, "conn", None))
+
+    # One DB fetch for every override policy (+ suffix candidates), all chunks merged
+    # before resolving, so a policy whose rows land in a later chunk is not a miss.
+    result_map: dict = {}
     db_lookups = 0
     db_misses = 0
-    override_pols_needing_db: Set[str] = set()
-
-    for (pol, prod), group in df.groupby([pol_col, prod_col], sort=False):
-        if not _is_override_group(group, prod_col, contract_col, rate_col):
-            continue
-        roles = {classify_contract_role(r.get(contract_col, "")) for _, r in group.iterrows()}
-        if roles <= {"agency"}:
-            override_pols_needing_db.add(str(pol).strip().strip("'\""))
-
-    if override_pols_needing_db and db_mgr is not None and getattr(db_mgr, "conn", None):
-        print(f"🔍 Override expand: looking up SL/Agent in DB for {len(override_pols_needing_db):,} agency-only policies...")
-        pol_list = sorted(override_pols_needing_db)
-        # Include suffix candidates for matching
-        expanded: List[str] = []
+    miss_log: List[str] = []
+    if override_keys and db_available:
+        pol_list = sorted({str(pol).strip().strip("'\"") for pol, _ in override_keys})
+        lookup_numbers: List[str] = []
+        seen_numbers: Set[str] = set()
         for p in pol_list:
-            expanded.append(p)
-            expanded.extend(policy_suffix_candidates(p))
-        chunk_size = 500
-        for i in range(0, len(expanded), chunk_size):
-            chunk = expanded[i : i + chunk_size]
-            result_map = db_mgr.batch_fetch_policy_commission_rules(agency_id, chunk, [])
-            for p in pol_list:
-                if p in db_people_by_pol:
-                    continue
-                candidates = [p] + policy_suffix_candidates(p)
-                people: Dict[str, dict] = {}
-                for cand in candidates:
-                    recs = result_map.get(cand, [])
-                    for rec in recs:
-                        found = _parse_split_people(rec.get("commission_split"))
-                        if "sales_leader" in found and "sales_leader" not in people:
-                            people["sales_leader"] = found["sales_leader"]
-                        if "agent" in found and "agent" not in people:
-                            people["agent"] = found["agent"]
-                        if "sub_agent" in found and "sub_agent" not in people:
-                            people["sub_agent"] = found["sub_agent"]
-                    if "sales_leader" in people and "agent" in people:
-                        break
-                db_lookups += 1
-                if people:
-                    db_people_by_pol[p] = people
-                else:
-                    db_misses += 1
-                    db_people_by_pol[p] = {}
+            for cand in [p] + policy_suffix_candidates(p):
+                if cand not in seen_numbers:
+                    seen_numbers.add(cand)
+                    lookup_numbers.append(cand)
+        print(f"🔍 Override expand: reading DB rules for {len(pol_list):,} override policies...")
+        for i in range(0, len(lookup_numbers), 500):
+            chunk_map = db_mgr.batch_fetch_policy_commission_rules(agency_id, lookup_numbers[i : i + 500], [])
+            for k, rows in (chunk_map or {}).items():
+                if isinstance(k, str):
+                    result_map.setdefault(k, []).extend(rows)
 
     out_frames: List[pd.DataFrame] = []
     groups_expanded = 0
     rows_appended = 0
-    miss_log: List[str] = []
+    invalid_log: List[str] = []
+    override_key_set = set(override_keys)
 
     for (pol, prod), group in df.groupby([pol_col, prod_col], sort=False):
-        if not _is_override_group(group, prod_col, contract_col, rate_col):
+        if (pol, prod) not in override_key_set:
             out_frames.append(group)
             continue
 
-        band_groups = group.groupby([fm_col, tm_col], sort=False)
+        pol_key = str(pol).strip().strip("'\"")
+        records: list = []
+        resolve_note = ""
+        if db_available:
+            db_lookups += 1
+            _, records, resolve_note = _resolve_policy_records(result_map, pol_key)
+            if not records:
+                db_misses += 1
+                miss_log.append(f"{pol_key} | {prod}")
+
         new_parts: List[pd.DataFrame] = []
         group_changed = False
+        group_invalid_reason = ""
 
-        for (fm, tm), band in band_groups:
-            role_map: Dict[str, pd.Series] = {}
-            for _, row in band.iterrows():
-                role = classify_contract_role(row.get(contract_col, ""))
-                # Prefer Broker/LVL as agent; keep first agency / first SL / first Sub Agent
-                if role not in role_map:
-                    role_map[role] = row
-                elif role == "agent" and str(role_map[role].get(contract_col, "")).lower() != "agent":
-                    # Prefer explicit Agent over Broker when both exist
-                    if str(row.get(contract_col, "")).strip().lower() == "agent":
-                        role_map[role] = row
-
-            agency_row = role_map.get("agency")
-            sl_row = role_map.get("sales_leader")
-            agent_row = role_map.get("agent")
-            sub_row = role_map.get("sub_agent")
-
-            # Drop bogus SL that is actually MLB/agency (live-app OVR bug)
-            if sl_row is not None and agent_name_col:
-                sl_name_chk = str(sl_row.get(agent_name_col, "")).strip()
-                if _is_mlb_or_agency_person(sl_name_chk):
-                    sl_row = None
-
-            template = agency_row if agency_row is not None else band.iloc[0]
-            # Start from band; rewrite Broker -> Agent so payload roles are Agency/SL/Agent
+        for (fm, tm), band in group.groupby([fm_col, tm_col], sort=False):
             band_out = band.copy()
-            if contract_col in band_out.columns:
-                broker_mask = band_out[contract_col].astype(str).str.strip().str.lower() == "broker"
-                if broker_mask.any():
-                    band_out.loc[broker_mask, contract_col] = "Agent"
-                    group_changed = True
-            parts = [band_out]
+            roles = band_out[contract_col].apply(classify_contract_role)
 
-            def _synth_row(contract_name: str, name: str, code: str, sequence: int) -> dict:
-                # Never put MLB on SL/Agent rows
-                if contract_name != "Agency" and _is_mlb_or_agency_person(name, code):
-                    name, code = "", ""
+            # Broker on an override sheet is the writing agent
+            broker_mask = band_out[contract_col].astype(str).str.strip().str.lower() == "broker"
+            if broker_mask.any():
+                band_out.loc[broker_mask, contract_col] = "Agent"
+                group_changed = True
+
+            def _first(role_key: str) -> Optional[pd.Series]:
+                hits = band_out[roles == role_key]
+                return hits.iloc[0] if len(hits) else None
+
+            agency_row = _first("agency")
+            sl_row = _first("sales_leader")
+            agent_row = _first("agent")
+            sub_row = _first("sub_agent")
+
+            if agency_row is None:
+                group_invalid_reason = group_invalid_reason or (
+                    f"Override months {fm}-{tm}: no Agency row in the file."
+                )
+                new_parts.append(band_out)
+                continue
+
+            band_from = _month_to_int(fm) or 1
+            people, source, source_months = ({}, "", "")
+            if db_available:
+                people, source, source_months = _pick_people_source(records, band_from)
+
+            def _file_person(row: Optional[pd.Series]) -> Optional[dict]:
+                if row is None:
+                    return None
+                name = str(row.get(agent_name_col, "")).strip() if agent_name_col else ""
+                code = clean_agent_code(str(row.get(agent_col, "")).strip()) if agent_col else ""
+                return {"name": name, "code": code, "uuid": "", "level": ""}
+
+            file_agent = _file_person(agent_row)
+            if file_agent and _is_mlb_or_agency_person(file_agent["name"], file_agent["code"]):
+                file_agent = None
+            file_sl = _file_person(sl_row)
+            file_sub = _file_person(sub_row)
+
+            if db_available:
+                agent_p = file_agent or people.get("agent")
+                sl_p = file_sl or people.get("sales_leader")
+                sub_p = file_sub or people.get("sub_agent")
+                # A Sub Agent who is the same person as the Agent is not a 4th level
+                if sub_p and not file_sub and agent_p and _same_split_person(sub_p, agent_p):
+                    sub_p = None
+                # File rows for the same person as the DB rule take its level and user uuid
+                for f_row, f_person, role_key in (
+                    (agent_row, file_agent, "agent"),
+                    (sl_row, file_sl, "sales_leader"),
+                    (sub_row, file_sub, "sub_agent"),
+                ):
+                    db_person = people.get(role_key)
+                    if f_row is None or not f_person or not db_person:
+                        continue
+                    if _same_split_person(f_person, db_person):
+                        band_out.loc[f_row.name, SPLIT_LEVEL_COL] = db_person.get("level", "")
+                        band_out.loc[f_row.name, SPLIT_USER_UUID_COL] = db_person.get("uuid", "")
+            else:
+                # No DB: old file-only fallback so dry runs still produce 3 rows
+                agent_p = file_agent
+                sl_p = file_sl or (dict(file_agent) if file_agent else None)
+                sub_p = file_sub
+
+            if not agent_p or not sl_p:
+                missing = [lbl for lbl, p in (("Sales Leader", sl_p), ("Agent", agent_p)) if not p]
+                if not db_available:
+                    why = "no DB connection to look up the regular rule"
+                elif resolve_note:
+                    why = resolve_note
+                elif not records:
+                    why = "policy not found in DB"
+                else:
+                    why = "no regular (non-override) rule with a Sales Leader and Agent on this policy"
+                group_invalid_reason = group_invalid_reason or (
+                    f"Override months {fm}-{tm}: missing {' and '.join(missing)} ({why})."
+                )
+                new_parts.append(band_out)
+                continue
+
+            template = agency_row
+
+            def _synth_row(contract_name: str, person: dict) -> dict:
                 row = template.to_dict()
                 row[contract_col] = contract_name
                 row[fm_col] = fm
                 row[tm_col] = tm
                 if rate_col:
-                    sample = template.get(rate_col) if rate_col in template.index else "0.00%"
-                    row[rate_col] = _format_rate_like(sample, 0.0)
+                    row[rate_col] = _format_rate_like(template.get(rate_col), 0.0)
                 if agent_name_col:
-                    row[agent_name_col] = name or ""
+                    row[agent_name_col] = person.get("name", "")
                 if agent_col:
-                    row[agent_col] = code or ""
+                    row[agent_col] = person.get("code", "")
                 if eacid_col:
-                    row[eacid_col] = code or row.get(eacid_col, "")
-                if status_col and (not row.get(status_col) or str(row.get(status_col)).lower() in ("", "nan")):
+                    row[eacid_col] = person.get("code", "")
+                if status_col:
                     row[status_col] = "Active"
-                if seq_col:
-                    row[seq_col] = sequence
                 if amt_col:
                     row[amt_col] = ""
+                row[SPLIT_LEVEL_COL] = person.get("level", "")
+                row[SPLIT_USER_UUID_COL] = person.get("uuid", "")
+                row[OVR_INVALID_COL] = ""
                 return row
 
-            pol_key = str(pol).strip().strip("'\"")
-            db_people = db_people_by_pol.get(pol_key, {})
+            appended: List[dict] = []
+            if agent_row is None:
+                appended.append(_synth_row("Agent", agent_p))
+            if sl_row is None:
+                appended.append(_synth_row("Sales Leader", sl_p))
+            if sub_row is None and sub_p:
+                appended.append(_synth_row("Sub Agent", sub_p))
 
-            if agent_row is None and sl_row is None and sub_row is None:
-                # Agency-only: pull from DB (MLB already filtered in _parse_split_people)
-                sl_info = db_people.get("sales_leader") or {}
-                ag_info = db_people.get("agent") or {}
-                sub_info = db_people.get("sub_agent") or {}
-                if sl_info and _is_mlb_or_agency_person(sl_info.get("name", ""), sl_info.get("code", "")):
-                    sl_info = {}
-                if ag_info and _is_mlb_or_agency_person(ag_info.get("name", ""), ag_info.get("code", "")):
-                    ag_info = {}
-                if sub_info and _is_mlb_or_agency_person(sub_info.get("name", ""), sub_info.get("code", "")):
-                    sub_info = {}
+            band_full = pd.concat([band_out, pd.DataFrame(appended)], ignore_index=True) if appended else band_out
+            band_full[OVR_SL_FROM_FILE_COL] = "Y" if sl_row is not None else ""
 
-                if not sl_info and not ag_info and not sub_info:
-                    miss_log.append(f"{pol_key} | {prod}")
-                elif sub_info:
-                    # 4-person override: Sub Agent=1, Agent=2, SL=3, Agency=4
-                    sub_dict = _synth_row(
-                        "Sub Agent",
-                        sub_info.get("name", ""),
-                        sub_info.get("code", ""),
-                        sequence=1,
-                    )
-                    ag_dict = _synth_row(
-                        "Agent",
-                        ag_info.get("name", "") or sub_info.get("name", ""),
-                        ag_info.get("code", "") or sub_info.get("code", ""),
-                        sequence=2,
-                    )
-                    sl_dict = _synth_row(
-                        "Sales Leader",
-                        sl_info.get("name", "") or ag_info.get("name", "") or sub_info.get("name", ""),
-                        sl_info.get("code", "") or ag_info.get("code", "") or sub_info.get("code", ""),
-                        sequence=3,
-                    )
-                    if seq_col and contract_col in parts[0].columns:
-                        agency_mask = parts[0][contract_col].astype(str).str.strip().str.lower() == "agency"
-                        parts[0].loc[agency_mask, seq_col] = 4
-                    parts.append(pd.DataFrame([sl_dict, ag_dict, sub_dict]))
-                    rows_appended += 3
-                    group_changed = True
-                else:
-                    # Broker/Agent alone → same person for SL and Agent @ 0%
-                    if not sl_info and ag_info:
-                        sl_info = dict(ag_info)
-                    if not ag_info and sl_info:
-                        ag_info = dict(sl_info)
-                    # Force distinct hierarchy: Agent=1, SL=2, Agency=3+
-                    ag_dict = _synth_row(
-                        "Agent",
-                        ag_info.get("name", ""),
-                        ag_info.get("code", ""),
-                        sequence=1,
-                    )
-                    sl_dict = _synth_row(
-                        "Sales Leader",
-                        sl_info.get("name", ""),
-                        sl_info.get("code", ""),
-                        sequence=2,
-                    )
-                    if seq_col and contract_col in parts[0].columns:
-                        agency_mask = parts[0][contract_col].astype(str).str.strip().str.lower() == "agency"
-                        parts[0].loc[agency_mask, seq_col] = 3
-                    parts.append(pd.DataFrame([sl_dict, ag_dict]))
-                    rows_appended += 2
-                    group_changed = True
-            elif sl_row is None and agent_row is not None:
-                # Agency + Broker/Agent: SL = Broker person @ 0% (not MLB)
-                # Sequences: Agent < Sales Leader < Agency (bump Agency if only 2 levels on sheet)
-                ag_name = str(agent_row.get(agent_name_col, "")).strip() if agent_name_col else ""
-                ag_code = clean_agent_code(str(agent_row.get(agent_col, "")).strip()) if agent_col else ""
-                if _is_mlb_or_agency_person(ag_name, ag_code):
-                    ag_name, ag_code = "", ""
-                try:
-                    ag_seq = int(float(agent_row.get(seq_col, 1))) if seq_col else 1
-                except (TypeError, ValueError):
-                    ag_seq = 1
-                try:
-                    agency_seq = int(float(agency_row.get(seq_col, ag_seq + 2))) if (seq_col and agency_row is not None) else ag_seq + 2
-                except (TypeError, ValueError):
-                    agency_seq = ag_seq + 2
-                if agency_seq <= ag_seq + 1:
-                    agency_seq = ag_seq + 2
-                sl_seq = ag_seq + 1
-                sl_dict = _synth_row("Sales Leader", ag_name, ag_code, sequence=sl_seq)
-                # Bump Agency sequence on the band copy so roll-up order stays correct
-                if seq_col and agency_row is not None and contract_col in parts[0].columns:
-                    agency_mask = parts[0][contract_col].astype(str).str.strip().str.lower() == "agency"
-                    parts[0].loc[agency_mask, seq_col] = agency_seq
-                parts.append(pd.DataFrame([sl_dict]))
-                rows_appended += 1
+            # Sequence by hierarchy: Sub Agent < Agent < Sales Leader < Agency
+            rank = {"sub_agent": 0, "agent": 1, "sales_leader": 2, "agency": 3}
+            full_roles = band_full[contract_col].apply(classify_contract_role)
+            present = sorted({rank.get(r, 1) for r in full_roles})
+            seq_of = {r: i + 1 for i, r in enumerate(present)}
+            band_full[seq_col] = [seq_of[rank.get(r, 1)] for r in full_roles]
+
+            if appended:
+                rows_appended += len(appended)
                 group_changed = True
-            elif agent_row is None and sl_row is not None:
-                # Append Agent with SL name @ 0% (SL already non-MLB)
-                sl_name = str(sl_row.get(agent_name_col, "")).strip() if agent_name_col else ""
-                sl_code = clean_agent_code(str(sl_row.get(agent_col, "")).strip()) if agent_col else ""
-                try:
-                    sl_seq = int(float(sl_row.get(seq_col, 2))) if seq_col else 2
-                except (TypeError, ValueError):
-                    sl_seq = 2
-                ag_dict = _synth_row("Agent", sl_name, sl_code, sequence=max(1, sl_seq - 1))
-                parts.append(pd.DataFrame([ag_dict]))
-                rows_appended += 1
-                group_changed = True
+            new_parts.append(band_full)
 
-            new_parts.append(pd.concat(parts, ignore_index=True))
-
-        if group_changed:
+        group_out = pd.concat(new_parts, ignore_index=True) if new_parts else group
+        if group_invalid_reason:
+            group_out[OVR_INVALID_COL] = group_invalid_reason
+            invalid_log.append(f"{pol_key} | {prod} | {group_invalid_reason}")
+        elif group_changed:
             groups_expanded += 1
-        out_frames.append(pd.concat(new_parts, ignore_index=True) if new_parts else group)
+        out_frames.append(group_out)
 
     df_out = pd.concat(out_frames, ignore_index=True) if out_frames else df.copy()
-    if miss_log:
-        print(f"⚠️ Override expand: {len(miss_log)} policy(ies) had no SL/Agent in DB (left as agency-only).")
-        for line in miss_log[:20]:
+    if invalid_log:
+        print(f"⚠️ Override expand: {len(invalid_log)} override policy(ies) sent to the invalid report "
+              f"(no Agency + Sales Leader + Agent could be built).")
+        for line in invalid_log[:20]:
             print(f"   - {line}")
-        if len(miss_log) > 20:
-            print(f"   ... and {len(miss_log) - 20} more")
+        if len(invalid_log) > 20:
+            print(f"   ... and {len(invalid_log) - 20} more")
+    if override_keys and not db_available:
+        print("⚠️ Override expand: no DB connection, so Sales Leader/Agent were not checked "
+              "against the regular rule (Broker used for both).")
 
     summary = {
         "groups_expanded": groups_expanded,
@@ -1340,6 +1538,8 @@ def ensure_override_three_rows(
         "db_lookups": db_lookups,
         "db_misses": db_misses,
         "db_miss_policies": miss_log,
+        "invalid_groups": len(invalid_log),
+        "invalid_policies": invalid_log,
     }
     return df_out.reset_index(drop=True), summary
 
@@ -1420,7 +1620,8 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
                     prev_seq = s - 1
                     if prev_seq in seq_amt_map:
                         prev_amt = seq_amt_map[prev_seq]
-                        adj_amounts.append(max(0.0, a - prev_amt))
+                        # Round to cents: 20.02 - 18.48 gives 1.5399999999999991 in float, not 1.54
+                        adj_amounts.append(max(0.0, round(a - prev_amt, 2)))
                     else:
                         adj_amounts.append(a)
                 else:
@@ -1437,7 +1638,8 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
                 for i, adj_a in enumerate(adj_amounts):
                     if i != primary_highest_idx:
                         raw_pct = (adj_a / total_amt) * 100.0
-                        trunc_pct = math.floor(raw_pct * 100.0) / 100.0
+                        # Small margin so 6.9999999999 is cut to 7.00, not 6.99
+                        trunc_pct = math.floor(raw_pct * 100.0 + 1e-6) / 100.0
                         rates_calc.append(trunc_pct)
                         non_highest_rate_sum += trunc_pct
                     else:
@@ -1466,7 +1668,7 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
                 prev_seq = s - 1
                 if prev_seq in seq_rate_map:
                     prev_r = seq_rate_map[prev_seq]
-                    rate_diffs.append(max(0.0, r - prev_r) if r > prev_r else r)
+                    rate_diffs.append(max(0.0, round(r - prev_r, 4)) if r > prev_r else r)
                 else:
                     rate_diffs.append(r)
 
@@ -1481,7 +1683,8 @@ def rollup_commission_splits(df: pd.DataFrame) -> pd.DataFrame:
                 for i, r_diff in enumerate(rate_diffs):
                     if i != primary_highest_idx:
                         raw_pct = (r_diff / total_rate) * 100.0
-                        trunc_pct = math.floor(raw_pct * 100.0) / 100.0
+                        # Small margin so 6.9999999999 is cut to 7.00, not 6.99
+                        trunc_pct = math.floor(raw_pct * 100.0 + 1e-6) / 100.0
                         rates_calc.append(trunc_pct)
                         non_highest_rate_sum += trunc_pct
                     else:
@@ -1550,6 +1753,7 @@ def stage1_pre_validate_dataset(
     prod_col = next((c for c in df_out.columns if str(c).strip().lower() in ("product", "product name", "product_description", "product_name")), None)
     fm_col = next((c for c in df_out.columns if str(c).strip().lower() in ("from month", "from_month", "month", "month from", "month_from")), None)
     tm_col = next((c for c in df_out.columns if str(c).strip().lower() in ("to month", "to_month", "month to", "month_to")), None)
+    contract_col_s1 = _find_col(df_out, ("contract", "level", "role"))
     carrier_comm_col = "Carrier Commission"
     payout_method_col = "Payout Method"
 
@@ -1627,6 +1831,33 @@ def stage1_pre_validate_dataset(
 
         extracted_comm_amt = parse_amount(extracted_comm_str)
         extracted_comm_pct = parse_rate(extracted_comm_str)
+
+        # -------------------------------------------------------------------
+        # CHECK OVR: Override bands need Agency + Sales Leader + Agent.
+        # Runs before the MLB exception so an Agency-only override is never VALID.
+        # -------------------------------------------------------------------
+        ovr_reason = ""
+        if OVR_INVALID_COL in group.columns:
+            ovr_reason = next(
+                (_clean_helper_text(v) for v in group[OVR_INVALID_COL] if _clean_helper_text(v)), ""
+            )
+        # Override = OVR product. An Agency-only renewal band on a regular product is not one.
+        is_override_band = is_override_product(raw_prod) or is_override_product(final_norm_prod)
+        if is_override_band and not ovr_reason and contract_col_s1:
+            present_roles = {classify_contract_role(group.loc[i, contract_col_s1]) for i in indices}
+            missing_roles = [
+                label for key, label in (("agency", "Agency"), ("sales_leader", "Sales Leader"), ("agent", "Agent"))
+                if key not in present_roles
+            ]
+            if missing_roles:
+                ovr_reason = f"Override band is missing {', '.join(missing_roles)} (needs Agency + Sales Leader + Agent)."
+        if ovr_reason:
+            for idx in indices:
+                validation_statuses[idx] = "INVALID_OVERRIDE_LEVELS"
+                expected_values[idx] = "Agency + Sales Leader + Agent"
+                variances[idx] = float(len(indices))
+                error_reasons[idx] = ovr_reason
+            continue
 
         # -------------------------------------------------------------------
         # CHECK 0: MLB Direct Exceptions (Bypass Stage 1 Validation)
@@ -2389,6 +2620,9 @@ def build_file_commission_split(group: pd.DataFrame, seq_col, agent_col, agent_n
         agent_name = str(row.get(agent_name_col, "")).strip() if agent_name_col else raw_agent_id
         contract = str(row.get(contract_col, "")).strip() if contract_col else ""
         commission_value = float(row.get(split_col, 0.0)) if split_col else 0.0
+        # Override rows built from the regular DB rule carry its level and user uuid
+        level_override = _clean_helper_text(row.get(SPLIT_LEVEL_COL))
+        uuid_override = _clean_helper_text(row.get(SPLIT_USER_UUID_COL))
 
         # Deduplicate by (sequence, agent_code) — file has multiple From Month rows per agent
         dedup_key = (seq, agent_id)
@@ -2402,6 +2636,8 @@ def build_file_commission_split(group: pd.DataFrame, seq_col, agent_col, agent_n
             "user_code": agent_id if agent_id else None,
             "commission_value": commission_value,
             "contract": contract,
+            "level_override": level_override,
+            "uuid_override": uuid_override,
         })
 
     # Role-first order so writing Sub Agent is always highest order (4), not dropped behind LVL
@@ -2459,6 +2695,12 @@ def build_file_commission_split(group: pd.DataFrame, seq_col, agent_col, agent_n
                 "entity": "agent",
                 "level": norm_level,
             })
+
+        if role_key != "agency":
+            if item.get("level_override"):
+                commission_split[-1]["level"] = normalize_level(item["level_override"])
+            if item.get("uuid_override"):
+                commission_split[-1]["user_uuid"] = item["uuid_override"]
 
     # Re-number orders 1..n in list order (Agency first … Sub Agent last = writing agent)
     for i, split in enumerate(commission_split):
@@ -2652,6 +2894,88 @@ def build_unmatched_issue_summary(
     )
 
 
+def _same_split_person(a: dict, b: dict) -> bool:
+    """True when two split entries name the same person (uuid, code, or name; MLB aliases match)."""
+    a_uuid = str(a.get("user_uuid") or a.get("uuid") or "").strip().lower()
+    b_uuid = str(b.get("user_uuid") or b.get("uuid") or "").strip().lower()
+    if a_uuid and b_uuid and a_uuid == b_uuid:
+        return True
+    a_code = clean_agent_code(str(a.get("user_code") or a.get("code") or "").strip().lower())
+    b_code = clean_agent_code(str(b.get("user_code") or b.get("code") or "").strip().lower())
+    if a_code and b_code and (a_code == b_code or are_codes_matching(a_code, b_code)):
+        return True
+    a_name = " ".join(clean_name_ignoring_id(a.get("user_name") or a.get("name")).lower().split())
+    b_name = " ".join(clean_name_ignoring_id(b.get("user_name") or b.get("name")).lower().split())
+    if _is_mlb_or_agency_person(a_name) and _is_mlb_or_agency_person(b_name):
+        return True
+    return bool(a_name and b_name and (a_name == b_name or are_names_matching(a_name, b_name)))
+
+
+def db_override_accepts_file(db_splits: list, file_splits: list, sl_from_file: bool) -> bool:
+    """A DB override that already has Agency 100% and a named Sales Leader + Agent is VALID.
+
+    Fee amount and payout method are not compared for overrides.
+    - Agent: must be the file's Agent; a different person means replace.
+    - Sales Leader: kept when it is the same person. When the DB has someone else
+      (often MLB), it is replaced only if the file sheet itself names a Sales Leader;
+      otherwise the DB Sales Leader is kept.
+    """
+    db_splits = _split_list(db_splits)
+    if not is_override_commission_split(db_splits):
+        return False
+    db_people = _hierarchy_people(db_splits)
+    if "sales_leader" not in db_people or "agent" not in db_people:
+        return False
+
+    def _file_role(role_name: str) -> Optional[dict]:
+        return next((s for s in file_splits or [] if str(s.get("role") or "") == role_name), None)
+
+    f_agent = _file_role("Agent")
+    f_sl = _file_role("Sales Leader")
+    if f_agent and not _same_split_person(f_agent, db_people["agent"]):
+        return False
+    if f_sl and not _same_split_person(f_sl, db_people["sales_leader"]) and sl_from_file:
+        return False
+    return True
+
+
+def find_db_slabs_inside_file_months(
+    comm_records: list,
+    file_bands: Set[Tuple[int, Optional[int]]],
+    file_is_override: bool,
+    skip_uuids: Set[str],
+) -> list:
+    """Same-type DB slabs that the file's months cover but that no file slab pairs with.
+
+    Example: DB 1-12, 13-24 and file 1-11, 12-36. DB 1-12 pairs with file 1-11 (same
+    From Month) and is replaced as a mismatch; DB 13-24 starts inside the file months
+    but no file slab starts at 13, so it is returned here and deleted.
+
+    Kept: DB slabs fully outside the file months, slabs with the exact months of a
+    file slab (matched, already replaced, or a duplicate), and the other type
+    (an override never overlaps a regular commission).
+    """
+    if not file_bands:
+        return []
+    file_intervals = [_interval_bounds(fm, tm or 0) for fm, tm in file_bands]
+    found = []
+    for rec in comm_records or []:
+        uid = str(rec.get("commission_uuid") or "").strip()
+        if not uid or uid in skip_uuids:
+            continue
+        if is_override_family(rule_effective_type(rec)) != file_is_override:
+            continue
+        db_fm = _month_to_int(rec.get("month_from")) or 1
+        db_tm_raw = rec.get("month_to")
+        db_tm = None if db_tm_raw is None or _month_to_int(db_tm_raw) <= 0 else _month_to_int(db_tm_raw)
+        if (db_fm, db_tm) in file_bands:
+            continue
+        start, end = _interval_bounds(db_fm, db_tm or 0)
+        if any(start <= f_end and f_start <= end for f_start, f_end in file_intervals):
+            found.append(rec)
+    return found
+
+
 def stage2_db_verify_dataset(
     df_valid: pd.DataFrame,
     db_mgr: DatabaseManager,
@@ -2672,6 +2996,8 @@ def stage2_db_verify_dataset(
 
     pol_col = next((c for c in df_out.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
     prod_col = next((c for c in df_out.columns if str(c).strip().lower() in ("normalized_product_name", "product name", "product")), None)
+    # Raw sheet product (OVR marker survives here even if the normalized name drops it)
+    prod_col_raw_s2 = next((c for c in df_out.columns if str(c).strip().lower() in ("product", "product name")), None)
     rate_col = next((c for c in df_out.columns if str(c).strip().lower() in ("rate", "rate %", "commission %")), None)
     agent_col = next((c for c in df_out.columns if str(c).strip().lower() in ("agent id", "agent_id", "agentid")), None)
     agent_name_col = next((c for c in df_out.columns if "agent name" in str(c).strip().lower() or str(c).strip().lower() == "agent_name"), None)
@@ -2722,6 +3048,7 @@ def stage2_db_verify_dataset(
         affected_persons[row_idx] = person_s
 
     matched_count = 0
+    slabs_inside_deleted = 0
     ambiguous_count = 0
     unmatched_count = 0
     missing_policy_payloads = []
@@ -2859,6 +3186,13 @@ def stage2_db_verify_dataset(
         pol_number = str(seq_1_row.get(pol_col, "")).strip()
         prod_name = str(seq_1_row.get(prod_col, "")).strip()
         clean_prod_name = " ".join(prod_name.lower().split())
+        # Per-group tracking for the "DB slab inside file months" delete pass
+        _mismatch_start = len(mismatch_policy_payloads)
+        _blocked_start = len(invalid_user_uuid_payloads)
+        _group_bands: Set[Tuple[int, Optional[int]]] = set()
+        _group_ctypes: Set[int] = set()
+        _group_comm_records: list = []
+        _group_pol_uuid = None
 
         if dry_run or not db_mgr.conn:
             mock_prod_uuid = f"mock-prod-{abs(hash(prod_name)) % 1000000:06d}"
@@ -2877,6 +3211,11 @@ def stage2_db_verify_dataset(
             is_ambiguous = False
             ambiguous_reason = ""
 
+            # Product names used to break a tie when a shortened number hits several policies:
+            # normalized name (normalization list) first, then the file's own product name.
+            _norm_prod_tb = str(seq_1_row.get("Normalized_Product_Name", "") or "").strip()
+            _file_prod_tb = str(seq_1_row.get(prod_col_raw_s2, "") or "").strip() if prod_col_raw_s2 else prod_name
+
             db_records = lookup_policy_db_records(chunk_db_map, pol_number, clean_prod_name)
             if not db_records and not is_mapped:
                 for candidate in policy_suffix_candidates(pol_number):
@@ -2890,10 +3229,14 @@ def stage2_db_verify_dataset(
                     }
                     distinct_uuids.discard("")
                     if len(distinct_uuids) > 1:
+                        picked, pick_reason = pick_policy_by_product(candidate_rows, _norm_prod_tb, _file_prod_tb)
+                        if picked:
+                            db_records = picked
+                            break
                         is_ambiguous = True
                         ambiguous_reason = (
                             f"Policy number '{pol_number}' matched {len(distinct_uuids)} policies "
-                            f"after removing the suffix ('{candidate}'). Not updated."
+                            f"after removing the suffix ('{candidate}'); {pick_reason}. Not updated."
                         )
                         db_records = []
                         break
@@ -2906,9 +3249,21 @@ def stage2_db_verify_dataset(
                 matched_full_pols = prefix_db_map.get(prefix, set())
 
                 if len(matched_full_pols) > 1:
-                    is_ambiguous = True
-                    ambiguous_reason = f"Policy number '{pol_number[:11]}...' matched multiple policies in DB."
-                    db_records = []
+                    prefix_rows = []
+                    for full_pol in sorted(matched_full_pols):
+                        rows_k = chunk_db_map.get(full_pol) or []
+                        if isinstance(rows_k, list):
+                            prefix_rows.extend(rows_k)
+                    picked, pick_reason = pick_policy_by_product(prefix_rows, _norm_prod_tb, _file_prod_tb)
+                    if picked:
+                        db_records = picked
+                    else:
+                        is_ambiguous = True
+                        ambiguous_reason = (
+                            f"Policy number '{pol_number[:11]}...' matched {len(matched_full_pols)} policies in DB; "
+                            f"{pick_reason}. Not updated."
+                        )
+                        db_records = []
                 elif len(matched_full_pols) == 1:
                     found_pol = next(iter(matched_full_pols))
                     db_records = lookup_policy_db_records(chunk_db_map, found_pol, clean_prod_name)
@@ -2957,6 +3312,8 @@ def stage2_db_verify_dataset(
                     comm_records = db_mgr.get_policy_commission(agency_id, found_pol_uuid)
                     if not comm_records:
                         not_found_commissions.add(found_pol_uuid)
+                _group_comm_records = comm_records or []
+                _group_pol_uuid = found_pol_uuid
 
                 if not comm_records:
                     unmatched_count += len(indices)
@@ -3124,6 +3481,16 @@ def stage2_db_verify_dataset(
                         _file_ctype = resolve_commission_type(
                             file_commission_split, product_name=prod_name
                         )
+                        # Override family = OVR product (file) / stored type 4 (DB)
+                        _file_is_override = is_override_product(prod_name) or is_override_product(
+                            row.get(prod_col_raw_s2, "") if prod_col_raw_s2 else ""
+                        )
+                        _group_ctypes.add(4 if _file_is_override else 1)
+                        _group_bands.add((file_fm, expected_db_tm))
+                        _tier_sl_from_file = (
+                            OVR_SL_FROM_FILE_COL in tier_group.columns
+                            and any(_clean_helper_text(v) == "Y" for v in tier_group[OVR_SL_FROM_FILE_COL])
+                        )
 
                         match_found = False
                         unmatched_agent = False
@@ -3138,6 +3505,10 @@ def stage2_db_verify_dataset(
                         # 1 = open-ended period match (fm matches, db_tm is NULL)
                         # 0 = match on fm only
                         def calc_comm_score(r):
+                            # Override and regular commission are separate slab sets:
+                            # never pair (or delete) a regular rule for an override row.
+                            if is_override_family(rule_effective_type(r)) != _file_is_override:
+                                return -1
                             db_fm_val = r.get("month_from")
                             db_tm_val = r.get("month_to")
                             try:
@@ -3165,6 +3536,26 @@ def stage2_db_verify_dataset(
                             db_fee = float(db_rec.get("fee_amount") or 0.0)
                             db_payout_raw = db_rec.get("payout_method")
                             db_payout_code = 1 if (isinstance(db_payout_raw, int) and db_payout_raw == 1) or str(db_payout_raw).strip() in ("1", "FIXED FEE", "FIXED_FEE") else 2
+
+                            # Override VALID rule: a type-4 DB rule for the same months with
+                            # Agency 100% (everyone else 0%) and a named Sales Leader + Agent matches,
+                            # whatever its fee value, as long as its payout type is the file's type
+                            # (file percentage -> DB percentage, file amount -> DB fixed fee).
+                            try:
+                                _db_stored_type = int(db_rec.get("commission_type") or 1)
+                            except (TypeError, ValueError):
+                                _db_stored_type = 1
+                            if (
+                                _file_is_override
+                                and _db_stored_type == 4
+                                and db_tm == expected_db_tm
+                                and db_payout_code == _file_payout_method_code
+                                and db_override_accepts_file(db_split_raw, file_commission_split, _tier_sl_from_file)
+                            ):
+                                match_found = True
+                                matched_commission_uuid = db_rec.get("commission_uuid")
+                                matched_db_rec = db_rec
+                                break
 
                             if isinstance(db_split_raw, list):
                                 # Prioritize splits matching the row's contract role
@@ -3320,7 +3711,29 @@ def stage2_db_verify_dataset(
                                 if unmatched_agent:
                                     matched_db_value_str = f"{matched_db_value}%" if matched_db_value is not None else "None"
                                     db_fee_curr = float(matched_db_rec.get("fee_amount") or 0.0) if matched_db_rec else 0.0
-                                    if matched_db_rec and abs(db_fee_curr - _file_fee_val) > tolerance:
+                                    _ovr_reason = []
+                                    if _file_is_override and matched_db_rec:
+                                        # Override: fee value is not compared; type, Agency 100% split and months are
+                                        _db_pay = matched_db_rec.get("payout_method")
+                                        _db_pay_code = 1 if (isinstance(_db_pay, int) and _db_pay == 1) or str(_db_pay).strip() in ("1", "FIXED FEE", "FIXED_FEE") else 2
+                                        _lbl = {1: "Fixed Fee", 2: "Percentage"}
+                                        if _db_pay_code != _file_payout_method_code:
+                                            _ovr_reason.append(
+                                                f"override payout type is {_lbl[_db_pay_code]} in DB but {_lbl[_file_payout_method_code]} in file"
+                                            )
+                                        if not is_override_commission_split(_split_list(matched_db_rec.get("commission_split"))):
+                                            _ovr_reason.append("override split is not Agency 100% with everyone else 0%")
+                                        if matched_db_rec.get("month_to") != expected_db_tm:
+                                            _ovr_reason.append(
+                                                f"override months differ (DB to {matched_db_rec.get('month_to')}, file to {expected_db_tm})"
+                                            )
+                                    if _ovr_reason:
+                                        unmatched_reasons[idx] = f"Override for '{row_agent_name}': " + "; ".join(_ovr_reason) + ". "
+                                    elif _file_is_override and matched_db_rec:
+                                        unmatched_reasons[idx] = (
+                                            f"Override for '{row_agent_name}': the Sales Leader or Agent in DB is a different person. "
+                                        )
+                                    elif matched_db_rec and abs(db_fee_curr - _file_fee_val) > tolerance:
                                         unmatched_reasons[idx] = (
                                             f"Agent '{row_agent_name}' found in DB, but DB fee_amount is {db_fee_curr} (File has {_file_fee_val}). "
                                         )
@@ -3437,7 +3850,8 @@ def stage2_db_verify_dataset(
                                             elif val_changed:
                                                 diff_lines.append(f"   Order {order_str} | User: {f_user_disp} | Rate: {old_val}% ➔ {new_val}%")
 
-                                            # Preserve existing DB fields (Rule C: DB values are authoritative for existing policies)
+                                            # Same person: keep the DB identity (uuid / name / code). A different person in
+                                            # this role: the file's person is posted. Either way the FILE value is posted.
                                             if not agent_changed:
                                                 for key in ["user_uuid", "user_name", "user_code"]:
                                                     if key in db_s:
@@ -3445,14 +3859,13 @@ def stage2_db_verify_dataset(
                                             for key in ["role", "level"]:
                                                 if key in db_s and not m_split.get(key):
                                                     m_split[key] = db_s[key]
-                                            # Preserve protected DB commission_value
-                                            m_split["commission_value"] = old_val
+                                            # File (rolled-up) commission_value is posted, not the DB value
+                                            m_split["commission_value"] = new_val
                                         else:
                                             diff_lines.append(f"   Order {order_str} | User: [NEW] ➔ {m_split.get('user_name', 'N/A')} | Rate: [NEW] ➔ {m_split.get('commission_value', 0.0)}%")
                                             if "level" in m_split:
                                                 m_split["level"] = normalize_level(m_split["level"])
-                                            # Newly introduced participants in existing policy update default to 0.0% unless specified
-                                            m_split["commission_value"] = 0.0
+                                            # A person only in the file is posted with the file value (already on m_split)
 
                                         if str(m_split.get("order", "")) == "1" or str(m_split.get("role", "")).lower() == "agency":
                                             m_split["user_uuid"] = "62a97a01-2801-4c7c-9cd0-cf38f2e0a4f4"
@@ -3480,8 +3893,8 @@ def stage2_db_verify_dataset(
 
                                         merged_splits.append(m_split)
 
-                                    # Preserve any extra DB split roles that were not present in the input file
-                                    # (Do NOT preserve empty placeholder/dummy slots that have no agent assigned and 0% commission)
+                                    # People in the DB split but not in the file are DROPPED (not carried over):
+                                    # the file split is posted as it is. Each dropped person is listed in the diff.
                                     file_roles = {_role_key_of(f) for f in file_commission_split}
                                     file_people = set()
                                     for f_split in file_commission_split:
@@ -3498,10 +3911,12 @@ def stage2_db_verify_dataset(
                                         db_name = _person_name_key(str(db_s.get("user_name") or ""))
                                         if (db_code and ("code", db_code) in file_people) or (db_name and ("name", db_name) in file_people):
                                             continue
-                                        has_valid_uuid = bool(db_s.get("user_uuid"))
-                                        has_val = float(db_s.get("commission_value") or 0.0) > 0.0
-                                        if has_valid_uuid or has_val:
-                                            merged_splits.append(db_s.copy())
+                                        if db_s.get("user_name") or float(db_s.get("commission_value") or 0.0) != 0.0:
+                                            diff_lines.append(
+                                                f"   Order {db_s.get('order', '')} | User: {db_s.get('user_name', '')} "
+                                                f"({db_s.get('role', '')}) dropped - not in file "
+                                                f"(was {float(db_s.get('commission_value') or 0.0)}%)"
+                                            )
 
                                     # Override split-sum correction: when Agency takes 100% in an OVERRIDE, set non-agency to 0% to prevent 199% sums
                                     _candidate_ctype = resolve_commission_type(
@@ -3509,11 +3924,14 @@ def stage2_db_verify_dataset(
                                         product_name=prod_name,
                                         db_commission_type=matched_db_rec.get("commission_type", 1),
                                     )
-                                    if _candidate_ctype == 4:
+                                    _is_override_rule = _file_is_override or _candidate_ctype == 4
+                                    if _is_override_rule:
+                                        # Override: Agency always 100%, everyone else 0%
                                         agency_item = next((s for s in merged_splits if str(s.get("role", "")).lower() == "agency"), None)
-                                        if agency_item and float(agency_item.get("commission_value") or 0.0) >= 99.99:
+                                        if agency_item:
+                                            agency_item["commission_value"] = 100.0
                                             for s in merged_splits:
-                                                if str(s.get("role", "")).lower() != "agency":
+                                                if s is not agency_item:
                                                     s["commission_value"] = 0.0
 
                                     merged_splits.sort(key=lambda s: int(s.get("order") or 999))
@@ -3524,7 +3942,8 @@ def stage2_db_verify_dataset(
                                         diff_lines.append(f"   Period: {db_fm_val}-{db_tm_val} ➔ {file_fm}-{file_tm_val}")
 
                                     db_fee_val = float(matched_db_rec.get("fee_amount") or 0.0)
-                                    if abs(db_fee_val - _file_fee_val) > tolerance:
+                                    # Override: the fee value is not compared or updated (only the payout type)
+                                    if not _is_override_rule and abs(db_fee_val - _file_fee_val) > tolerance:
                                         payout_label = "Fixed Fee" if _file_payout_method_code == 1 else "Rate"
                                         diff_lines.append(f"   Fee/Rate ({payout_label}): {db_fee_val} ➔ {_file_fee_val}")
 
@@ -3567,7 +3986,10 @@ def stage2_db_verify_dataset(
                                         if matched_db_rec.get("writing_agent_user_id")
                                         else (db_records[0] if db_records else None)
                                     )
-                                    # Rule C: preserve protected DB values in mismatch_payload
+                                    # Replacement rule: the FILE split values, fee and payout type are posted
+                                    # (only uuid / name / code of an unchanged person and premium come from the DB).
+                                    # Override: the file payout type is posted, the DB fee value is kept,
+                                    # and the split is Agency 100% / everyone else 0% (set above).
                                     mismatch_payload = {
                                         "rule_uuid": matched_commission_uuid,
                                         "policyNumber": pol_number,
@@ -3582,29 +4004,25 @@ def stage2_db_verify_dataset(
                                         "version": matched_db_rec.get("version") or 1,
                                         "commissionType": _ctype,
                                         "paymentFrequency": matched_db_rec.get("payment_frequency", 1),
-                                        "payoutMethod": db_payout_code,
+                                        "payoutMethod": _file_payout_method_code,
                                         "monthFrom": file_fm,
                                         "monthTo": expected_db_tm,
-                                        "feeAmount": db_fee_val,
+                                        "feeAmount": db_fee_val if _is_override_rule else _file_fee_val,
                                         "premiumAmount": float(matched_db_rec.get("premium_amount") or 0.0),
                                         "commissionSplit": merged_splits,
                                         "_diff_text": diff_text
                                     }
                                     split_issues = commission_payload_issues(mismatch_payload)
 
-                                    # PUT guard: the DB "left" split percentages must equal the
-                                    # file "right" split percentages. Skip + log on mismatch.
-                                    if _file_payout_method_code == 2:
-                                        _db_pct_total = round(sum(float(s.get("commission_value") or 0.0) for s in db_splits_list), 2)
-                                        _new_pct_total = round(sum(float(s.get("commission_value") or 0.0) for s in merged_splits), 2)
-                                        is_199_override_fix = (
-                                            _ctype == 4
-                                            and _db_pct_total > 100.0 + tolerance
-                                            and abs(_new_pct_total - 100.0) <= tolerance
-                                        )
-                                        if not is_199_override_fix and abs(_db_pct_total - _new_pct_total) > tolerance:
+                                    # The file split is posted, so it is no longer compared with the DB split total;
+                                    # commission_payload_issues() above already requires the posted split to total 100%.
+                                    # No person in the posted split may have a negative share (e.g. a carried-over DB -0.31%).
+                                    for _s in merged_splits:
+                                        _cv = float(_s.get("commission_value") or 0.0)
+                                        if _cv < 0:
                                             split_issues.append(
-                                                f"Split sum mismatch: DB left {_db_pct_total:.2f}% != File right {_new_pct_total:.2f}%"
+                                                f"Order {_s.get('order', '')} {_s.get('role', '')} "
+                                                f"'{_s.get('user_name', '')}' has a negative share ({_cv:g}%)"
                                             )
 
                                     if split_issues:
@@ -3612,7 +4030,46 @@ def stage2_db_verify_dataset(
                                         invalid_user_uuid_payloads.append(mismatch_payload)
                                     else:
                                         mismatch_policy_payloads.append(mismatch_payload)
-    
+
+        # DB slabs inside the file's months that no file slab pairs with (e.g. DB 13-24
+        # when the file has 1-11, 12-36) are deleted so the posted file slabs do not overlap.
+        # Held when any payload of this group was blocked, so a delete never runs without
+        # its replacement, or when the group mixes override and regular rows.
+        if _group_comm_records and _group_bands and len(_group_ctypes) == 1:
+            if len(invalid_user_uuid_payloads) > _blocked_start:
+                pass
+            else:
+                _replaced_uuids = {
+                    str(p.get("rule_uuid") or "").strip()
+                    for p in mismatch_policy_payloads[_mismatch_start:]
+                }
+                _inside = find_db_slabs_inside_file_months(
+                    _group_comm_records,
+                    _group_bands,
+                    file_is_override=(4 in _group_ctypes),
+                    skip_uuids=_replaced_uuids,
+                )
+                _bands_txt = ", ".join(
+                    f"{fm}-{tm if tm is not None else 'open'}" for fm, tm in sorted(_group_bands, key=lambda b: b[0])
+                )
+                for _rec in _inside:
+                    _to = _rec.get("month_to")
+                    _db_months = f"{_month_to_int(_rec.get('month_from')) or 1}-{_to if _to is not None else 'open'}"
+                    mismatch_policy_payloads.append({
+                        "rule_uuid": _rec.get("commission_uuid"),
+                        "policyNumber": pol_number,
+                        "policyUuid": _rec.get("policy_uuid") or _group_pol_uuid,
+                        "monthFrom": _rec.get("month_from"),
+                        "monthTo": _to,
+                        "commissionType": rule_effective_type(_rec),
+                        "_delete_only": True,
+                        "_diff_text": (
+                            f"   DB slab {_db_months} deleted: it sits inside the file months "
+                            f"({_bands_txt}), which replace it"
+                        ),
+                    })
+                    slabs_inside_deleted += 1
+
         if group_idx % 50 == 0 or group_idx == total_groups:
             pct = (group_idx / total_groups) * 100.0
             sys.stdout.write(
@@ -3622,6 +4079,11 @@ def stage2_db_verify_dataset(
             sys.stdout.flush()
 
     print(f"\n   ✅ Stage 2 Database Verification Completed! {matched_count:,} matched rows, {unmatched_count:,} unmatched rows.")
+    if slabs_inside_deleted:
+        print(
+            f"   🧹 {slabs_inside_deleted:,} DB slab(s) sit inside the file months without a matching file slab; "
+            f"queued for delete only (no POST)."
+        )
 
     df_out["obtained_product_uuid"] = obtained_product_uuids
     df_out["obtained_policy_uuid"] = obtained_policy_uuids
@@ -3663,7 +4125,8 @@ def stage2_db_verify_dataset(
     # Dedup the mismatch payloads by rule_uuid
     unique_mismatch_payloads = []
     seen_mismatches = set()
-    for mp in mismatch_policy_payloads:
+    # Replace payloads first, so a delete-only entry never hides the POST for the same rule
+    for mp in sorted(mismatch_policy_payloads, key=lambda x: bool(x.get("_delete_only"))):
         if mp["rule_uuid"] not in seen_mismatches:
             seen_mismatches.add(mp["rule_uuid"])
             unique_mismatch_payloads.append(mp)
@@ -4521,6 +4984,318 @@ def write_policy_update_status_excel(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Readable validation summary (validation_summary_<run>.md)
+# ---------------------------------------------------------------------------
+MD_MAX_ITEMS_PER_SECTION = 300
+
+STAGE1_STATUS_TEXT = {
+    "INVALID_POLICY_ROW_COUNT": "Each month band needs 3 or 4 people (Agency, Sales Leader, Agent, and an optional Sub Agent). This band has a different number.",
+    "INVALID_OVERRIDE_LEVELS": "An override needs an Agency, a Sales Leader and an Agent. One of them is missing and could not be taken from the policy's regular rule.",
+    "NEGATIVE_SPLIT_SHARE": "One person's share works out below 0%, so a higher level is paid less than the level under it.",
+    "INVALID_SPLIT_SUM": "The shares in this band do not add up to 100%.",
+    "MISSING_POLICY_NUMBER": "The row has no policy number.",
+    "UNMATCHED_MONTH_RANGE": "The months do not fit any tier in the rate sheet.",
+    "UNMATCHED_PRODUCT_IN_RATE_SHEET": "The product is not in the rate sheet.",
+    "VALUE_MISMATCH": "The commission in the file does not match the rate sheet.",
+}
+
+
+def _md_months(fm, tm) -> str:
+    def _num(v):
+        s = str(v if v is not None else "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return "" if s.lower() in ("", "nan", "none") else s
+    a, b = _num(fm), _num(tm)
+    if not a:
+        return "Months: not given"
+    if not b or b == "0":
+        return f"Months {a} onwards"
+    return f"Months {a}–{b}"
+
+
+def _md_escape(text) -> str:
+    return str(text if text is not None else "").replace("|", "/").replace("\n", " ").strip()
+
+
+def explain_reason(reason: str) -> str:
+    """Turn a Stage 2 reason into one plain sentence."""
+    r = str(reason or "").strip()
+    if not r or r.lower() == "nan":
+        return ""
+    m = re.search(r"Agent '(.+?)' found in DB, but DB commission_value is ([\d.]+|None)%? \(File has ([\d.]+)%\)", r)
+    if m:
+        name = " ".join(m.group(1).split()).title()
+        return f"{name}: the file gives {m.group(3)}%, the system has {m.group(2)}%."
+    m = re.search(r"Agent '(.+?)' found in DB, but DB fee_amount is ([\d.]+) \(File has ([\d.]+)\)", r)
+    if m:
+        return f"The carrier commission is ${m.group(3)} in the file but ${m.group(2)} in the system."
+    m = re.search(r"No commission rule record found in policy_commission table for agent '(.+?)'", r)
+    if m:
+        name = " ".join(m.group(1).split()).title()
+        return f"{name} is in the file but is not on the system's rule for these months."
+    m = re.search(r"No commission rule found in DB for period (\S+) -> (\S+)\.", r)
+    if m:
+        return "The policy has commission rules, but none for these months. A new rule will be added from the file."
+    if "No commission rules in policy_commission table" in r:
+        return "The policy is in the system but has no commission rules yet. The file's rules will be added."
+    if "not found in policies table" in r:
+        return "This policy number is not in the system (also tried with the trailing digits removed)."
+    m = re.search(r"Policy number '(.+?)' matched (\d+) policies after removing the suffix \('(.+?)'\); (.+?)\. Not updated\.", r)
+    if m:
+        return (
+            f"The number is not in the system as written. With the last digit(s) removed ({m.group(3)}) "
+            f"it matches {m.group(2)} different policies, and the product could not tell them apart: "
+            f"{m.group(4)}. Nothing was changed."
+        )
+    m = re.search(r"Policy number '(.+?)\.\.\.' matched (\d+) policies in DB; (.+?)\. Not updated\.", r)
+    if m:
+        return (
+            f"The first 11 characters ({m.group(1)}) match {m.group(2)} different policies, and the product "
+            f"could not tell them apart: {m.group(3)}. Nothing was changed."
+        )
+    if "matched multiple policies" in r or ("matched" in r and "policies in DB" in r):
+        return f"The policy number matches more than one policy in the system, so nothing was changed. ({r})"
+    return r
+
+
+def _md_split_table(db_val, file_val) -> Tuple[List[str], bool]:
+    """Markdown table rows comparing file vs DB people; returns (lines, any_difference)."""
+    try:
+        db_list = json.loads(db_val) if isinstance(db_val, str) and db_val.strip().startswith("[") else db_val
+        file_list = json.loads(file_val) if isinstance(file_val, str) and file_val.strip().startswith("[") else file_val
+    except (json.JSONDecodeError, TypeError):
+        return [], False
+    if not isinstance(db_list, list) or not isinstance(file_list, list):
+        return [], False
+    db_by = {it.get("order"): it for it in db_list if isinstance(it, dict)}
+    fi_by = {it.get("order"): it for it in file_list if isinstance(it, dict)}
+    lines = [
+        "| Role | In the file | In the system | File % | System % | Same? |",
+        "|------|-------------|---------------|--------|----------|-------|",
+    ]
+    any_diff = False
+    for o in sorted(set(db_by) | set(fi_by), key=lambda x: (x is None, x)):
+        d, f = db_by.get(o, {}), fi_by.get(o, {})
+        role = f.get("role") or d.get("role") or ""
+        d_cv, f_cv = d.get("commission_value"), f.get("commission_value")
+        d_name = " ".join(str(d.get("user_name") or "").split())
+        f_name = " ".join(str(f.get("user_name") or "").split())
+        if "sub agent" in role.lower() and not f_name and not d_name:
+            continue  # empty Sub Agent slot on both sides
+        try:
+            same_val = d_cv is not None and f_cv is not None and abs(float(d_cv) - float(f_cv)) <= 0.05
+        except (TypeError, ValueError):
+            same_val = False
+        same_person = (
+            (not d_name and not f_name)
+            or are_names_matching(f_name.lower(), d_name.lower())
+            or are_codes_matching(str(f.get("user_code") or ""), str(d.get("user_code") or ""))
+            or ("main line benefits" in f_name.lower() and "mlb parallel run" in d_name.lower())
+        )
+        ok = same_val and same_person
+        any_diff = any_diff or not ok
+        fv = f"{f_cv}%" if f_cv is not None else "—"
+        dv = f"{d_cv}%" if d_cv is not None else "—"
+        mark = "✅" if ok else "❌"
+        if not ok:
+            fv, dv = f"**{fv}**", f"**{dv}**"
+        lines.append(
+            f"| {_md_escape(role)} | {_md_escape(f_name.title()) or '—'} | {_md_escape(d_name.title()) or '—'} "
+            f"| {fv} | {dv} | {mark} |"
+        )
+    return lines, any_diff
+
+
+def _md_band_groups(df: pd.DataFrame, reason_col: str):
+    """Group report rows by (policy, product, from, to); yields (key, rows_df)."""
+    if df is None or df.empty:
+        return []
+    pol = _find_col(df, ("policy no", "policy number", "policy", "policyno", "policy_number"))
+    prod = _find_col(df, ("product", "product name", "normalized_product_name"))
+    fm = _find_col(df, ("from month", "from_month", "month_from"))
+    tm = _find_col(df, ("to month", "to_month", "month_to"))
+    keys = [c for c in (pol, prod, fm, tm) if c]
+    if not keys:
+        return []
+    out = []
+    for key, g in df.groupby(keys, sort=True, dropna=False):
+        key = key if isinstance(key, tuple) else (key,)
+        vals = dict(zip(keys, key))
+        out.append((
+            str(vals.get(pol, "")),
+            str(vals.get(prod, "")),
+            _md_months(vals.get(fm), vals.get(tm)),
+            g,
+        ))
+    return out
+
+
+def write_readable_summary_md(
+    md_path: str,
+    *,
+    source_file: str,
+    counts: dict,
+    df_stage1_invalid: pd.DataFrame,
+    df_stage2_unmatched: pd.DataFrame,
+    df_stage2_ambiguous: pd.DataFrame,
+    missing_payloads: list,
+    mismatch_payloads: list,
+    blocked_payloads: list,
+    snapshot_path: Optional[str] = None,
+) -> None:
+    """Write the validation summary in plain language, one entry per policy + month band."""
+    c = counts
+    n_post_new = len(missing_payloads or [])
+    n_replace = sum(1 for p in (mismatch_payloads or []) if not p.get("_delete_only"))
+    n_delete_only = sum(1 for p in (mismatch_payloads or []) if p.get("_delete_only"))
+    n_blocked = len(blocked_payloads or [])
+    W = []
+    W.append("# Commission validation summary\n")
+    W.append(f"**File:** {os.path.basename(str(source_file or ''))}  ")
+    W.append(f"**Run at:** {datetime.datetime.now().strftime('%d %b %Y, %H:%M')}\n")
+
+    W.append("## At a glance\n")
+    W.append("| | Rows | Policies |")
+    W.append("|---|---:|---:|")
+    W.append(f"| Rows in the file | {c['tot_records']:,} | {c.get('tot_pols', 0):,} |")
+    if c.get("s1_dup"):
+        W.append(f"| Exact duplicate rows (removed) | {c['s1_dup']:,} | |")
+    if c.get("s1_zero"):
+        W.append(f"| Zero commission (ignored) | {c['s1_zero']:,} | |")
+    W.append(f"| ❌ Failed the file checks (not compared) | {c['s1_err']:,} | {c.get('s1_err_pols', 0):,} |")
+    W.append(f"| ✅ Same as the system | {c['s2_match']:,} | {c.get('s2_match_pols', 0):,} |")
+    W.append(f"| ⚠️ Different from the system, or missing there | {c['s2_unmatch']:,} | {c.get('s2_unmatch_pols', 0):,} |")
+    if c.get("s2_ambig"):
+        W.append(f"| ⚠️ Could not tell which policy (not compared) | {c['s2_ambig']:,} | {c.get('s2_ambig_pols', 0):,} |")
+    W.append("")
+
+    W.append("## What will change if you confirm the update\n")
+    if not (n_post_new or n_replace or n_delete_only):
+        W.append("**Nothing.** There is nothing to delete or post: the file already matches the system, "
+                 "or the differences were set aside below.\n")
+    else:
+        W.append("Nothing has been changed yet. These changes happen only after you confirm.\n")
+        if n_post_new:
+            W.append(f"- **{n_post_new:,}** new rule(s) will be added (the system has none for those months).")
+        if n_replace:
+            W.append(f"- **{n_replace:,}** rule(s) differ from the file: the system rule is deleted and posted again.")
+        if n_delete_only:
+            W.append(f"- **{n_delete_only:,}** system rule(s) sit inside months the file now covers with other slabs; they are deleted only.")
+        W.append("")
+    if n_blocked:
+        W.append(f"⛔ **{n_blocked:,}** rule(s) are held back and will not be posted, because they failed the final checks. "
+                 "See *Held back* below.\n")
+
+    def _section(title: str, intro: str, groups, body_fn):
+        if not groups:
+            return
+        W.append(f"## {title} ({len(groups):,})\n")
+        W.append(intro + "\n")
+        for i, (pol, prod, months, g) in enumerate(groups):
+            if i >= MD_MAX_ITEMS_PER_SECTION:
+                W.append(f"_…and {len(groups) - MD_MAX_ITEMS_PER_SECTION:,} more; see the Excel report._\n")
+                break
+            W.append(f"### Policy {pol} · {months}")
+            W.append(f"*{_md_escape(prod)}*\n")
+            body_fn(g)
+            W.append("")
+
+    # 1) Differences / missing in the system
+    def _s2_body(g):
+        reasons = []
+        for r in g.get("Stage2_Unmatched_Reason", pd.Series(dtype=str)).tolist():
+            t = explain_reason(r)
+            if t and t not in reasons:
+                reasons.append(t)
+        for t in reasons:
+            W.append(f"- {t}")
+        first = g.iloc[0]
+        table, _ = _md_split_table(first.get("DB_Value"), first.get("File_Value"))
+        if table:
+            W.append("")
+            W.extend(table)
+
+    _section(
+        "Different from the system",
+        "The file and the system disagree for these policies and months. ❌ marks the lines that differ.",
+        _md_band_groups(df_stage2_unmatched, "Stage2_Unmatched_Reason"),
+        _s2_body,
+    )
+
+    # 2) Ambiguous
+    def _amb_body(g):
+        t = explain_reason(g.iloc[0].get("Stage2_Unmatched_Reason", ""))
+        if t:
+            W.append(f"- {t}")
+
+    amb_groups = _md_band_groups(df_stage2_ambiguous, "Stage2_Unmatched_Reason")
+    # One entry per policy is enough for ambiguous: the reason is the same for every band
+    seen_pol, amb_one = set(), []
+    for item in amb_groups:
+        if item[0] not in seen_pol:
+            seen_pol.add(item[0])
+            amb_one.append((item[0], item[1], "all months", item[3]))
+    _section(
+        "Could not tell which policy",
+        "These policies were not compared or changed. Check the policy number or product in the file.",
+        amb_one,
+        _amb_body,
+    )
+
+    # 3) Stage 1 errors
+    def _s1_body(g):
+        statuses = [s for s in g.get("Stage1_Status", pd.Series(dtype=str)).dropna().unique().tolist()]
+        for s in statuses:
+            W.append(f"- {STAGE1_STATUS_TEXT.get(str(s), str(s))}")
+        details = []
+        for r in g.get("Stage1_Error_Reason", pd.Series(dtype=str)).dropna().tolist():
+            r = " ".join(str(r).split())
+            if r and r.lower() != "nan" and r not in details:
+                details.append(r)
+        for d in details[:3]:
+            W.append(f"  - Detail: {_md_escape(d)}")
+        name_col = _find_col(g, ("agent name", "agent_name"))
+        contract_col = _find_col(g, ("contract", "level", "role"))
+        if name_col:
+            people = []
+            for _, row in g.iterrows():
+                who = " ".join(str(row.get(name_col, "")).split()).title()
+                lvl = str(row.get(contract_col, "") if contract_col else "").strip()
+                lvl = "" if lvl.lower() == "nan" else lvl
+                people.append(f"{who} ({lvl or 'no contract level'})")
+            W.append(f"  - People in this band: {', '.join(people)}")
+
+    _section(
+        "Failed the file checks",
+        "These rows were not compared with the system. Fix them in the file and run again.",
+        _md_band_groups(df_stage1_invalid, "Stage1_Error_Reason"),
+        _s1_body,
+    )
+
+    # 4) Held back
+    if n_blocked:
+        W.append(f"## Held back ({n_blocked:,})\n")
+        W.append("These rules were built but will not be posted, because they failed the final checks.\n")
+        W.append("| Policy | Months | Why |")
+        W.append("|---|---|---|")
+        for i, p in enumerate(blocked_payloads):
+            if i >= MD_MAX_ITEMS_PER_SECTION:
+                W.append(f"\n_…and {n_blocked - MD_MAX_ITEMS_PER_SECTION:,} more; see rejected_missing_user_uuid_payloads_*.json._")
+                break
+            why = str(p.get("_issue_reason") or "").replace("Order ", "Line ")
+            why = why.replace("level is null", "has no contract level").replace("Split sum mismatch DB left != File right", "the new shares do not add up to the system's total")
+            W.append(f"| {p.get('policyNumber', '')} | {_md_months(p.get('monthFrom'), p.get('monthTo'))} | {_md_escape(why)} |")
+        W.append("")
+
+    if snapshot_path:
+        W.append(f"---\nSystem rules at the time of this run: [{os.path.basename(snapshot_path)}]({snapshot_path})\n")
+
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(W) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="2-Stage Policy Commission Import Validation & DB Verification Script")
     parser.add_argument(
@@ -4695,6 +5470,21 @@ def main():
     if len(df_duplicates) > 0:
         print(f"🧹 Preprocessing: Removed {len(df_duplicates):,} exact duplicate rows.")
 
+    # Overrides on hold: set OVR rows aside (not validated, never deleted or posted)
+    df_override_on_hold = pd.DataFrame()
+    if not OVERRIDE_UPDATES_ENABLED:
+        _prod_col_hold = next((c for c in df_comm_dedup.columns if str(c).strip().lower() in ("product", "product name")), None)
+        if _prod_col_hold:
+            _ovr_mask = df_comm_dedup[_prod_col_hold].apply(is_override_product)
+            df_override_on_hold = df_comm_dedup[_ovr_mask].copy()
+            df_comm_dedup = df_comm_dedup[~_ovr_mask].copy().reset_index(drop=True)
+            if len(df_override_on_hold):
+                _hold_pols = df_override_on_hold[pol_col].nunique() if pol_col else 0
+                print(
+                    f"⏸️  Overrides on hold: {len(df_override_on_hold):,} OVR row(s) across {_hold_pols:,} policy(ies) set aside "
+                    f"(no override check, no DELETE, no POST)."
+                )
+
     # Year-band From-To alignment + override Agency 100% -> 3 rows (before Stage 1 roll-up)
     if not args.skip_normalize:
         print("\n----------------------------------------------------------")
@@ -4782,6 +5572,11 @@ def main():
         df_duplicates.to_excel(dup_path, index=False)
         print(f" 📁 Phase 1 Duplicates  : {dup_path}")
         
+    if len(df_override_on_hold) > 0:
+        hold_path = os.path.join(output_dir, f"overrides_on_hold_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        df_override_on_hold.to_excel(hold_path, index=False)
+        print(f" 📁 Overrides on hold   : {hold_path}")
+
     zero_path = ""
     if len(df_stage1_zero) > 0:
         zero_path = os.path.join(output_dir, f"file_validated_zero_comm_ignored_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
@@ -5007,150 +5802,34 @@ def main():
     if snapshot_path:
         print(f" 📁 DB Snapshot File    : {snapshot_path}")
     print("=========================================================================================")
-    # Write comprehensive markdown summary report
-    # Prepare detailed mismatches (if any)
-    detail_rows = None
-    if not df_stage2_unmatched.empty:
-        # Detect actual column names dynamically
-        pol_col = next((c for c in df_stage2_unmatched.columns if str(c).strip().lower() in ("policy no", "policy number", "policy", "policyno", "policy_number")), None)
-        prod_col = next((c for c in df_stage2_unmatched.columns if str(c).strip().lower() in ("normalized_product_name", "product name", "product")), None)
-        fm_col = next((c for c in df_stage2_unmatched.columns if str(c).strip().lower() in ("from month", "from_month", "month_from")), None)
-        tm_col = next((c for c in df_stage2_unmatched.columns if str(c).strip().lower() in ("to month", "to_month", "month_to")), None)
-        detail_cols = [c for c in [pol_col, prod_col, fm_col, tm_col, "DB_Value", "File_Value", "Stage2_Unmatched_Reason"] if c and c in df_stage2_unmatched.columns]
-        detail_rows = df_stage2_unmatched[detail_cols].fillna("") if detail_cols else None
-    # Create markdown summary file
+    # Write the readable markdown summary (one entry per policy + month band)
     md_summary_path = os.path.join(output_dir, f"validation_summary_{run_version}.md")
     try:
-        with open(md_summary_path, "w", encoding="utf-8") as md_file:
-            md_file.write("# Validation Summary Report\n\n")
-            md_file.write(f"**Total Input Records Uploaded:** {tot_records}\n")
-            if s1_dup > 0:
-                md_file.write(f"**Exact Duplicates (Removed):** {s1_dup} ({pct_s1_dup:.2f}%)\n")
-            md_file.write(f"**Unique Records Processed:** {tot_unique} ({pct_tot_unique:.2f}%)\n\n")
-            if s1_zero > 0:
-                md_file.write(f"**Phase 1 Zero Comm (Ignored):** {s1_zero} ({pct_s1_zero:.2f}%)\n")
-            md_file.write(f"**Phase 1 Clean:** {s1_clean} ({pct_s1_clean:.2f}%)\n")
-            md_file.write(f"**Phase 1 Errors:** {s1_err} ({pct_s1_err:.2f}%)\n\n")
-            md_file.write(f"**Phase 2 Matched:** {s2_match} ({pct_s2_match:.2f}%)\n")
-            if s2_ambig > 0:
-                md_file.write(f"**Phase 2 Ambiguous (Skipped):** {s2_ambig} ({pct_s2_ambig:.2f}%)\n")
-            md_file.write(f"**Phase 2 Unmatched:** {s2_unmatch} ({pct_s2_unmatch:.2f}%)\n\n")
-            md_file.write(f"**TOTAL FAILED / UNMATCHED (P1+P2):** {tot_unmatch} ({pct_tot_unmatch:.2f}%)\n\n")
-            if snapshot_path:
-                md_file.write(f"**DB Commission Snapshot:** [{os.path.basename(snapshot_path)}]({snapshot_path})\\n\\n")
-            if detail_rows is not None and not detail_rows.empty:
-                md_file.write("## Detailed Stage 2 Mismatches\n\n")
-                for _, row in detail_rows.iterrows():
-                    policy_val = str(row.get(pol_col, "")) if pol_col and pol_col in detail_rows.columns else ""
-                    product_val = str(row.get(prod_col, "")) if prod_col and prod_col in detail_rows.columns else ""
-                    db_val = str(row.get("DB_Value", "")) if "DB_Value" in detail_rows.columns else ""
-                    file_val = str(row.get("File_Value", "")) if "File_Value" in detail_rows.columns else ""
-                    reason = str(row.get("Stage2_Unmatched_Reason", "")) if "Stage2_Unmatched_Reason" in detail_rows.columns else ""
-                    from_month = str(row.get(fm_col, "")).replace(".0", "") if fm_col and fm_col in detail_rows.columns else ""
-                    to_month = str(row.get(tm_col, "")).replace(".0", "") if tm_col and tm_col in detail_rows.columns else ""
-                    month_range = f" | **Month Range:** {from_month} → {to_month}" if from_month else ""
-
-                    md_file.write("---\n\n")
-                    md_file.write(f"**Policy No:** {policy_val} | **Product:** {product_val}{month_range}\n\n")
-
-                    # Try to parse both as JSON and render comparison table
-                    db_parsed = None
-                    file_parsed = None
-                    try:
-                        if db_val and db_val not in ("NOT_FOUND", "COMMISSION_NOT_FOUND", ""):
-                            db_parsed = json.loads(db_val)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                    try:
-                        if file_val and file_val not in ("", "NOT_FOUND"):
-                            file_parsed = json.loads(file_val)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                    if isinstance(db_parsed, list) and isinstance(file_parsed, list):
-                        # Build lookup maps by order
-                        db_by_order = {item.get("order"): item for item in db_parsed if isinstance(item, dict)}
-                        file_by_order = {item.get("order"): item for item in file_parsed if isinstance(item, dict)}
-                        all_orders = sorted(set(list(db_by_order.keys()) + list(file_by_order.keys())))
-
-                        # Collect all rows and highlight mismatches
-                        table_rows = []
-                        has_any_mismatch = False
-                        for o in all_orders:
-                            db_entry = db_by_order.get(o, {})
-                            file_entry = file_by_order.get(o, {})
-                            
-                            db_cv = db_entry.get("commission_value")
-                            file_cv = file_entry.get("commission_value")
-                            
-                            db_agent = db_entry.get("user_name", "") or ""
-                            file_agent = file_entry.get("user_name", "") or ""
-                            db_code = db_entry.get("user_code", "") or ""
-                            file_code = file_entry.get("user_code", "") or ""
-
-                            # Check value match
-                            val_match = db_cv is not None and file_cv is not None and abs(float(db_cv) - float(file_cv)) <= 0.05
-                            
-                            # Check agent match
-                            db_norm = " ".join(str(db_agent).lower().split())
-                            file_norm = " ".join(str(file_agent).lower().split())
-                            agent_match = False
-                            if file_code and db_code and (str(file_code).strip() == str(db_code).strip() or are_codes_matching(file_code, db_code)):
-                                agent_match = True
-                            elif file_norm and db_norm and (file_norm == db_norm or are_names_matching(file_norm, db_norm)):
-                                agent_match = True
-                            elif not file_norm and not db_norm:
-                                agent_match = True  # Both missing agent (e.g. fixed fee)
-                            elif str(o) == "1" and (
-                                ("main line benefits" in file_norm and "mlb parallel run" in db_norm) or
-                                ("mlb parallel run" in file_norm and "main line benefits" in db_norm)
-                            ):
-                                agent_match = True
-
-                            role = file_entry.get("role") or db_entry.get("role") or ""
-
-                            # Ignore Sub Agent N/A vs 0% mismatch
-                            if "sub agent" in role.lower() and file_cv is None and db_cv is not None and float(db_cv) == 0.0:
-                                val_match = True
-                                agent_match = True
-
-                            is_mismatch = not (val_match and agent_match)
-                            if is_mismatch:
-                                has_any_mismatch = True
-
-                            file_agent_str = f"{file_agent} ({file_code})" if file_code else str(file_agent)
-                            db_agent_str = f"{db_agent} ({db_code})" if db_code else str(db_agent)
-                            
-                            file_cv_str = f"{file_cv}%" if file_cv is not None else "_N/A_"
-                            db_cv_str = f"{db_cv}%" if db_cv is not None else "_N/A_"
-                            
-                            # Highlight mismatching rows
-                            if is_mismatch:
-                                o_str = f"**{o} ❌**"
-                                role = f"**{role}**"
-                                file_agent_str = f"**{file_agent_str}**"
-                                db_agent_str = f"**{db_agent_str}**"
-                                file_cv_str = f"**{file_cv_str}**"
-                                db_cv_str = f"**{db_cv_str}**"
-                            else:
-                                o_str = str(o)
-                            
-                            table_rows.append((o_str, role, file_agent_str, db_agent_str, file_cv_str, db_cv_str))
-
-                        if has_any_mismatch and table_rows:
-                            md_file.write(f"**Reason:** {reason}\n\n")
-                            md_file.write("| Order | Role | File Agent (Code) | DB Agent (Code) | File Value | DB Value |\n")
-                            md_file.write("|-------|------|-------------------|-----------------|------------|----------|\n")
-                            for o_str, role, fa, da, fv, dv in table_rows:
-                                md_file.write(f"| {o_str} | {role} | {fa} | {da} | {fv} | {dv} |\n")
-                            md_file.write("\n")
-                        else:
-                            md_file.write(f"**Reason:** {reason}\n\n")
-                    else:
-                        # NOT_FOUND or non-JSON — just show the reason
-                        md_file.write(f"**Reason:** {reason}\n\n")
-
-                md_file.write("\n")
+        write_readable_summary_md(
+            md_summary_path,
+            source_file=input_file or "",
+            counts={
+                "tot_records": tot_records,
+                "tot_pols": count_unique_pols(df_comm),
+                "s1_dup": s1_dup,
+                "s1_zero": s1_zero,
+                "s1_err": s1_err,
+                "s1_err_pols": count_unique_pols(df_stage1_invalid),
+                "s2_match": s2_match,
+                "s2_match_pols": count_unique_pols(df_stage2_matched),
+                "s2_unmatch": s2_unmatch,
+                "s2_unmatch_pols": count_unique_pols(df_stage2_unmatched),
+                "s2_ambig": s2_ambig,
+                "s2_ambig_pols": count_unique_pols(df_stage2_ambiguous),
+            },
+            df_stage1_invalid=df_stage1_invalid,
+            df_stage2_unmatched=df_stage2_unmatched,
+            df_stage2_ambiguous=df_stage2_ambiguous,
+            missing_payloads=unique_missing_payloads,
+            mismatch_payloads=unique_mismatch_payloads,
+            blocked_payloads=invalid_user_uuid_payloads,
+            snapshot_path=snapshot_path,
+        )
     except Exception as e:
         print(f"⚠️ Failed to write markdown summary: {e}")
     print(f"\n📝 Validation summary markdown saved to: {md_summary_path}")
@@ -5168,6 +5847,9 @@ def main():
         deduped = []
         seen_keys = set()
         for p in payloads:
+            if p.get("_delete_only"):
+                # DB slab inside the file months: deleted, never posted
+                continue
             key = (
                 str(p.get("policyUuid") or ""),
                 str(p.get("monthFrom")),
@@ -5197,6 +5879,15 @@ def main():
     )
     post_payloads = all_candidate_payloads
     do_api_delete = False
+
+    # One machine-readable line for the UI (ui/runner.parse_gate_hints): lets it hide the
+    # DELETE/POST confirmation when there is nothing to delete or post.
+    _gate_mismatch_post = sum(1 for p in (unique_mismatch_payloads or []) if not p.get("_delete_only"))
+    print(
+        f"GATE_SUMMARY missing_post={len(unique_missing_payloads or [])} "
+        f"mismatch_post={_gate_mismatch_post} delete={delete_line_count} "
+        f"blocked={len(invalid_user_uuid_payloads or [])}"
+    )
 
     # Always generate the mismatch DELETE SQL (UUID list) when there is anything to delete.
     delete_sql_path = None
@@ -5255,6 +5946,12 @@ def main():
             print(f"Rules available to create: {len(all_candidate_payloads)}")
             print(f"  - missing in DB (no delete): {len(unique_missing_payloads or [])}")
             print(f"  - mismatch rows to delete:   {delete_line_count}")
+            _delete_only_count = sum(1 for p in (unique_mismatch_payloads or []) if p.get("_delete_only"))
+            if _delete_only_count:
+                print(
+                    f"    (of which {_delete_only_count} are DB slabs inside the file months: "
+                    f"delete only, the file slabs replace them)"
+                )
             print(f"  - lines that will be deleted: {delete_line_count}")
             print("  - endpoint: DELETE /api/v1/policy/commission/{uuid}")
             print("  - matched slabs are omitted from DELETE and are not posted")
